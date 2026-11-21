@@ -33,6 +33,7 @@ That's it. Press **F11** for fullscreen and **HOME** for settings.
 | **120 FPS mode** *(experimental)* | 3 generated frames per real frame, for 120 Hz monitors. |
 | **Fast** | Motion estimation takes about 5 ms on its own thread, and the frame building runs in a GPU shader. |
 | **Image cleanup** | Removes USB capture-card compression blocks, noise and banding, then sharpens without halos. |
+| **Vignette removal** | Undoes GTA VI's heavy screen-edge darkening, using a curve measured from real gameplay. Adjustable in settings. |
 | **HUD-safe** | Minimap, crosshair and subtitles are protected from warping. |
 | **Motion blur and smoothing** | An adjustable, cinematic look. Both can be turned off. |
 | **Low-latency audio** | Passes capture-card audio straight to your speakers. |
@@ -43,7 +44,7 @@ That's it. Press **F11** for fullscreen and **HOME** for settings.
 
 | Key | Action |
 |---|---|
-| `HOME` | Settings: target FPS, mode, motion blur, sharpness, smoothing |
+| `HOME` | Settings: target FPS, mode, motion blur, sharpness, smoothing, vignette removal |
 | `F11` | Borderless fullscreen (works with overlays) |
 | `R` | Record an 8 s test clip to `recordings/` |
 | `M` | Mute audio |

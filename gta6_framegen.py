@@ -405,6 +405,16 @@ uniform int u_hudProtect;    // 1 = Protect text/HUD/UI edges from warp & MJPEG 
 uniform vec2 u_texelSize;    // (1/1920, 1/1080)
 uniform float u_blur;        // Motion blur shutter (0 = off .. 1 = full output-frame shutter)
 uniform float u_frameStep;   // Fraction of a console frame per output frame (0.5 at 60, 0.25 at 120)
+uniform float u_devig;       // 0..1 strength of game-vignette removal
+
+// Undo the game's vignette. Fitted on tracked points across camera pans in recorded GTA VI gameplay:
+// linear-light gain V = 1 - 0.75 * r^2, r = 0 center .. 1 corner, elliptical in screen space.
+vec3 devignette(vec3 c, vec2 uv) {
+    if (u_devig <= 0.0) return c;
+    vec2 d = uv - 0.5;
+    float v = 1.0 - u_devig * 0.75 * dot(d, d) * 2.0;
+    return clamp(pow(pow(c, vec3(2.2)) / max(v, 0.25), vec3(1.0 / 2.2)), 0.0, 1.0);
+}
 
 float getLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
@@ -568,7 +578,7 @@ vec3 hsv2rgb(vec3 c) {
 void main() {
     if (u_mode == 1) {
         vec3 c = texture(u_texCurr, v_uv).rgb;
-        fragColor = vec4(applyCAS(u_texCurr, v_uv, c, u_sharpness), 1.0);
+        fragColor = vec4(devignette(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
         return;
     }
     if (u_mode == 3) {
@@ -601,9 +611,9 @@ void main() {
         }
         if (v_uv.x < 0.5) {
             vec3 c = texture(u_texCurr, v_uv).rgb;
-            fragColor = vec4(applyCAS(u_texCurr, v_uv, c, u_sharpness), 1.0);
+            fragColor = vec4(devignette(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
         } else {
-            fragColor = vec4(synthesizeFrame(v_uv, u_alpha), 1.0);
+            fragColor = vec4(devignette(synthesizeFrame(v_uv, u_alpha), v_uv), 1.0);
         }
         return;
     }
@@ -631,7 +641,7 @@ void main() {
             col = mix(acc / 9.0, col, keep);
         }
     }
-    fragColor = vec4(col, 1.0);
+    fragColor = vec4(devignette(col, v_uv), 1.0);
 }
 """
 
@@ -658,6 +668,7 @@ class FrameGenGLWidget(QOpenGLWidget):
         self.zero_hold_extrap = False  # False = Interpolation, True = 0ms Hold Hybrid Extrapolation
         self.hud_protect = True
         self.motion_blur = 0.5         # 180-degree-style shutter by default
+        self.devignette = 1.0          # remove the game's vignette (0..1)
         self.sharpness = 0.5          # Lower default (25%) + text-edge suppression eliminates MJPEG text noise
 
         # Telemetry verification counters: track distinct presented frames (real vs synthesized)
@@ -850,6 +861,7 @@ class FrameGenGLWidget(QOpenGLWidget):
         gl.glUniform2f(gl.glGetUniformLocation(self.program, "u_texelSize"), 1.0 / 1920.0, 1.0 / 1080.0)
         gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_blur"), float(self.motion_blur))
         gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_frameStep"), 30.0 / max(30, self.target_fps))
+        gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_devig"), float(self.devignette))
 
         gl.glBindVertexArray(self.vao)
         gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
@@ -1036,6 +1048,16 @@ class GTA6FrameGenWindow(QMainWindow):
         row_blur.addWidget(self.slider_blur)
         layout.addLayout(row_blur)
 
+        row_vig = QHBoxLayout()
+        self.lbl_vig = QLabel("Remove Game Vignette: 100%")
+        row_vig.addWidget(self.lbl_vig)
+        self.slider_vig = QSlider(Qt.Orientation.Horizontal)
+        self.slider_vig.setRange(0, 100)
+        self.slider_vig.setValue(100)
+        self.slider_vig.valueChanged.connect(self._on_vig_slider)
+        row_vig.addWidget(self.slider_vig)
+        layout.addLayout(row_vig)
+
         self.chk_smooth = QCheckBox("Motion Smoothing (temporal vector smoothing)")
         self.chk_smooth.setStyleSheet("background: transparent; border: none;")
         self.chk_smooth.setChecked(True)
@@ -1146,6 +1168,10 @@ class GTA6FrameGenWindow(QMainWindow):
         self.gl_widget.sharpness = val / 100.0
         self.lbl_sharp.setText(f"Edge-Safe Sharpness (CAS): {val}%")
         self._update_telemetry()
+
+    def _on_vig_slider(self, val: int):
+        self.gl_widget.devignette = val / 100.0
+        self.lbl_vig.setText(f"Remove Game Vignette: {val}%")
 
     def _on_blur_slider(self, val: int):
         self.gl_widget.motion_blur = val / 100.0
