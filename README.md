@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/icon.png" alt="PhantomFrame icon" width="128">
+</p>
+
+<p align="center">
   <img src="assets/banner.svg" alt="PhantomFrame" width="100%">
 </p>
 
@@ -19,8 +23,21 @@ git clone https://github.com/rpatty-dev/phantomframe; cd phantomframe; pip insta
 
 That's it. Press **F11** for fullscreen and **HOME** for settings.
 
-> **Need:** Windows 10/11 · Python 3.10+ · a USB HDMI capture card · any GPU with OpenGL 3.3.
+> **Need:** Windows 10/11 or macOS · Python 3.10+ · a USB HDMI capture card · any GPU with OpenGL 3.3.
 > **Recommended:** `winget install ffmpeg` so PhantomFrame can find your capture card by name.
+
+### macOS
+
+```bash
+git clone https://github.com/rpatty-dev/phantomframe; cd phantomframe; ./run.command
+```
+
+Or double-click `run.command` in Finder. It makes a `.venv` and installs the requirements on first run.
+
+- Press **`\`** for settings (Mac keyboards have no HOME key).
+- On first launch macOS asks to let Terminal use the camera. Allow it: the capture card counts as a camera. If you clicked Don't Allow, turn it on in System Settings > Privacy & Security > Camera.
+- `brew install ffmpeg` lets PhantomFrame find the card by name and skip the FaceTime and iPhone cameras.
+- Frames are paced on a precise timer on macOS, since Windows' DWM vblank isn't available.
 
 ---
 
@@ -73,7 +90,7 @@ That's it. Press **F11** for fullscreen and **HOME** for settings.
 
 ### Defaults
 
-Tuned on real GTA VI gameplay. Change anything with `HOME`; your changes are kept.
+Tuned on real GTA VI gameplay. Change anything with `HOME` (`\` on macOS); your changes are kept.
 
 | Setting | Default |
 |---|---|
@@ -96,7 +113,7 @@ Tuned on real GTA VI gameplay. Change anything with `HOME`; your changes are kep
 
 | Key | Action |
 |---|---|
-| `HOME` | Settings panel |
+| `HOME` (`\` on macOS) | Settings panel |
 | `F11` / `F` | Borderless fullscreen (works with overlays) |
 | `Space` | Frame generation on / off |
 | `Tab` | Cycle mode: frame generation, raw passthrough, split screen, flow heatmap |

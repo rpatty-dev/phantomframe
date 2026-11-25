@@ -18,7 +18,7 @@ import numpy as np
 import cv2
 
 from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
-from PyQt6.QtGui import QSurfaceFormat, QKeySequence, QShortcut, QCursor
+from PyQt6.QtGui import QSurfaceFormat, QKeySequence, QShortcut, QCursor, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSlider, QCheckBox, QFrame
@@ -35,9 +35,15 @@ except Exception:
     pass
 
 
+# Mac keyboards have no Home key: "\\" opens settings there
+SETTINGS_KEY = "\\" if sys.platform == "darwin" else "HOME"
+
+
 def find_capture_card_index(preferred_name="USB Video") -> tuple[int, str, list[tuple[int, str]]]:
     """Enumerate DirectShow video devices via ffmpeg and match preferred capture card."""
     devices = []
+    if sys.platform == "darwin":
+        return _find_capture_card_mac(preferred_name)
     try:
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
@@ -58,6 +64,38 @@ def find_capture_card_index(preferred_name="USB Video") -> tuple[int, str, list[
     if devices:
         return devices[0][0], devices[0][1], devices
     return 1, preferred_name, [(1, preferred_name)]
+
+
+# Built-in / Continuity cameras to skip when no device matches the preferred capture card name
+_MAC_NON_CAPTURE = ("facetime", "iphone", "ipad", "desk view", "capture screen", "built-in")
+
+
+def _find_capture_card_mac(preferred_name):
+    """macOS: enumerate AVFoundation video devices via ffmpeg (brew install ffmpeg)."""
+    devices = []
+    try:
+        res = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=4
+        )
+        for line in res.stderr.splitlines():
+            if "audio devices" in line:
+                break
+            m = re.search(r'\]\s*\[(\d+)\]\s+(.+)$', line)
+            if m:
+                devices.append((int(m.group(1)), m.group(2).strip()))
+    except Exception:
+        pass
+
+    for idx, name in devices:
+        if preferred_name.lower() in name.lower():
+            return idx, name, devices
+    for idx, name in devices:
+        if not any(k in name.lower() for k in _MAC_NON_CAPTURE):
+            return idx, name, devices
+    if devices:
+        return devices[0][0], devices[0][1], devices  # no capture card: built-in camera, so the pipeline still runs
+    return 0, preferred_name, [(0, preferred_name)]
 
 
 class LowLatencyAudioBridge:
@@ -237,13 +275,20 @@ class CaptureFlowEngine:
         return dis
 
     def _loop(self):
-        cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW, [
-            cv2.CAP_PROP_FRAME_WIDTH, 1920,
-            cv2.CAP_PROP_FRAME_HEIGHT, 1080,
-            cv2.CAP_PROP_FPS, 60,
-            cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'),
-            cv2.CAP_PROP_BUFFERSIZE, 1,
-        ])
+        if sys.platform == "darwin":
+            # AVFoundation has no MJPG/buffer-size props; set the mode after opening
+            cap = cv2.VideoCapture(self.device_index, cv2.CAP_AVFOUNDATION)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            cap.set(cv2.CAP_PROP_FPS, 60)
+        else:
+            cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW, [
+                cv2.CAP_PROP_FRAME_WIDTH, 1920,
+                cv2.CAP_PROP_FRAME_HEIGHT, 1080,
+                cv2.CAP_PROP_FPS, 60,
+                cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'),
+                cv2.CAP_PROP_BUFFERSIZE, 1,
+            ])
 
         prev_small = None
         cap_times = deque(maxlen=60)
@@ -811,7 +856,7 @@ class FrameGenGLWidget(QOpenGLWidget):
 
         vs = shaders.compileShader(VERTEX_SHADER, gl.GL_VERTEX_SHADER)
         fs = shaders.compileShader(FRAGMENT_SHADER, gl.GL_FRAGMENT_SHADER)
-        self.program = shaders.compileProgram(vs, fs)
+        self.program = shaders.compileProgram(vs, fs, validate=False)  # macOS fails validation before a framebuffer is bound
 
         self.vao = gl.glGenVertexArrays(1)
         gl.glBindVertexArray(self.vao)
@@ -1134,7 +1179,7 @@ class GTA6FrameGenWindow(QMainWindow):
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(8)
 
-        title = QLabel("GTA VI FRAMEGEN — SETTINGS [HOME]")
+        title = QLabel(f"GTA VI FRAMEGEN — SETTINGS [{SETTINGS_KEY}]")
         title.setStyleSheet("color: #FF3E9D; font-size: 16px; font-weight: bold; letter-spacing: 1px;")
         layout.addWidget(title)
 
@@ -1317,6 +1362,8 @@ class GTA6FrameGenWindow(QMainWindow):
 
     def _bind_shortcuts(self):
         QShortcut(QKeySequence("Home"), self, activated=self.toggle_settings_panel)
+        if sys.platform == "darwin":
+            QShortcut(QKeySequence(Qt.Key.Key_Backslash), self, activated=self.toggle_settings_panel)
         QShortcut(QKeySequence("F"), self, activated=self.toggle_fullscreen)
         QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
         QShortcut(QKeySequence("Escape"), self, activated=self.on_escape)
@@ -1467,13 +1514,13 @@ class GTA6FrameGenWindow(QMainWindow):
         line2 = (
             f"Flow: {self.engine.flow_ms:.2f}ms ({preset_str}, Peak {self.engine.flow_max_px:.1f}px)  |  "
             f"{lat_mode}  |  Text/HUD Lock: {hud_str}  |  CAS: {int(self.gl_widget.sharpness*100)}%  |  "
-            f"Audio: {aud_str}   ||   [Home] Settings  [F] Fullscreen  [Tab] Mode  [O] Hide Bar"
+            f"Audio: {aud_str}   ||   [{SETTINGS_KEY}] Settings  [F] Fullscreen  [Tab] Mode  [O] Hide Bar"
         )
         self.osd_label.setText(f"{line1}\n{line2}")
         self.fps_label.setText(f"{eff_fps:.0f} FPS")
         self._place_fps_label()
         rec =f"[{self.engine.rec_status}] " if self.engine.rec_status else ""
-        self.setWindowTitle(f"{rec}GTA VI FrameGen — {eff_fps:.1f} FPS ({mode_str}) [Press HOME for Settings]")
+        self.setWindowTitle(f"{rec}GTA VI FrameGen — {eff_fps:.1f} FPS ({mode_str}) [Press {SETTINGS_KEY} for Settings]")
 
     def closeEvent(self, event):
         self.hud_timer.stop()
@@ -1485,6 +1532,9 @@ class GTA6FrameGenWindow(QMainWindow):
 
 def main():
     auto_quit = 0.0
+    if sys.platform == "darwin":
+        # macOS camera permission can only be requested from the main thread; the capture thread can't ask
+        cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION).release()
     if "--self-test" in sys.argv:
         auto_quit = 4.0
 
@@ -1495,7 +1545,15 @@ def main():
     fmt.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
     QSurfaceFormat.setDefaultFormat(fmt)
 
+    if sys.platform == "win32":
+        # Own taskbar entry, so Windows shows our icon instead of python.exe's
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PhantomFrame")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    app.setApplicationName("PhantomFrame")
+    app.setWindowIcon(QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png")))  # taskbar + Dock
     win = GTA6FrameGenWindow(auto_quit_sec=auto_quit)
     win.show()
 
