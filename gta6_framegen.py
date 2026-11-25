@@ -39,7 +39,7 @@ except Exception:
 # Mac keyboards have no Home key: "\\" opens settings there
 SETTINGS_KEY = "\\" if sys.platform == "darwin" else "HOME"
 
-APP_VERSION = "v1.4"
+APP_VERSION = "v1.5"
 REPO = "rpatty-dev/phantomframe"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UPDATE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -204,9 +204,10 @@ class LowLatencyAudioBridge:
 
         self.source = QAudioSource(in_dev, fmt)
         self.sink = QAudioSink(out_dev, fmt)
-        # ~10ms input / ~12ms output instead of 12/24ms: same passthrough, less audio lag.
-        self.source.setBufferSize(1920)
-        self.sink.setBufferSize(2304)
+        # 12ms input / 24ms output. The 10/12ms v1.3 buffers underran on the capture Mac and
+        # produced static whenever the GUI thread was busy presenting a frame.
+        self.source.setBufferSize(2304)
+        self.sink.setBufferSize(4608)
 
         self.io_out = self.sink.start()
         self.io_in = self.source.start()
