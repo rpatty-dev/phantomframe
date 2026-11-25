@@ -39,7 +39,7 @@ except Exception:
 # Mac keyboards have no Home key: "\\" opens settings there
 SETTINGS_KEY = "\\" if sys.platform == "darwin" else "HOME"
 
-APP_VERSION = "v1.3"
+APP_VERSION = "v1.4"
 REPO = "rpatty-dev/phantomframe"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UPDATE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -269,7 +269,6 @@ class CaptureFlowEngine:
         self.flow_half = np.empty_like(self.flow, dtype=np.float16)
         # id() of the half buffer paintGL is uploading; flow thread must not overwrite it mid-upload.
         self.flow_uploading_id = None
-        self.flow_pub = {}                # seq -> time flow was published (per-tick deadlines)
         self.pair_id = 0
         self.last_unique_time = time.perf_counter()
         self.unique_period = 1.0 / 30.0
@@ -488,14 +487,11 @@ class CaptureFlowEngine:
                 self.flow_half = half_buf
                 self.scene_cut = is_cut
                 self.pair_id = seq
-                self.flow_pub[seq] = t_pub
-                if len(self.flow_pub) > 12:  # bounded: only recent pairs can still have live ticks
-                    for old in sorted(self.flow_pub)[:-8]:
-                        del self.flow_pub[old]
             slot = (slot + 1) % len(flow_bufs)
             prev_gray, prev_full = gray, frame
 
-            # Fallback deadline only (flow_pub is normally used). Kept conservative for slow machines.
+            # Display delay = p95 capture->publish latency + margin (one shared deadline for both
+            # midpoint and real ticks so the real duplicate can never overtake the midpoint).
             lat.append(t_pub - t_cap)
             self.flow_delay = float(np.clip(np.percentile(lat, 95) + 0.002, 0.003, 0.035))
 
@@ -903,7 +899,6 @@ class FrameGenGLWidget(QOpenGLWidget):
 
         self.uploaded_pair_id = -1
         self.uploaded_frame_id = -1
-        self.last_render = None  # (seq, alpha, old, use_live) for hold-on-no-tick
         self._viewport = (0, 0, 1920, 1080)
         self.mode = 0                  # 0: FrameGen, 1: Raw Passthrough, 2: Split Compare, 3: Flow Heatmap
         self.target_fps = 60           # 30, 60, 90, 120, 144
@@ -1023,6 +1018,9 @@ class FrameGenGLWidget(QOpenGLWidget):
         # waiting for the previous frame's transfer to finish. Fall back to a direct upload if
         # the driver refuses PBOs.
         try:
+            # Measured on macOS: PBO upload ~3.0ms vs direct ~2.2ms and less steady cadence.
+            if sys.platform == "darwin":
+                raise RuntimeError("direct upload is faster on macOS")
             self.pbos = gl.glGenBuffers(2)
             for pbo in self.pbos:
                 gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, pbo)
@@ -1107,7 +1105,6 @@ class FrameGenGLWidget(QOpenGLWidget):
             period = self.engine.unique_period
             scene_cut = self.engine.scene_cut
             ticks = list(self.engine.ticks)
-            flow_pub = dict(self.engine.flow_pub)
             need_upload = (pair_id != self.uploaded_pair_id)
             consecutive = (pair_id == self.uploaded_pair_id + 1)
             need_live = (frame_id != self.uploaded_frame_id)
@@ -1159,8 +1156,6 @@ class FrameGenGLWidget(QOpenGLWidget):
         tick_sig = None
         old = False  # render the previous pair (tex_pp -> tex_prev) instead of the current one
         use_live = False  # real frame: bind the freshly decoded texture, no flow needed
-        render_seq = pair_id
-        chosen_tick = None
         if scene_cut or self.mode == 1 or self.target_fps <= 30:
             alpha = 1.0
             use_live = True
@@ -1168,67 +1163,34 @@ class FrameGenGLWidget(QOpenGLWidget):
             alpha = 1.0 if elapsed < half_period else 1.38
             use_live = True
         elif self.target_fps in (60, 120):
-            # Real ticks (alpha 1) are ready the moment they are decoded: show them on the next
-            # vblank. Midpoint ticks wait only for their own flow publish, not a global p90 delay.
-            alpha = 1.0
+            # One output tick per HDMI frame (midpoint on unique, real on repeat), shown a fixed
+            # delay after capture. Per-tick "ready now" deadlines let the real duplicate overtake
+            # the midpoint in the same paint and halved distinct output frames on macOS.
+            alpha, tick_sig = 1.0, (pair_id, 1.0)
+            flow_delay = self.engine.flow_delay + self.phase_adj
             t_sel = self.vblank_t if self.use_vblank else t_now
-            base_delay = self.engine.flow_delay
             for t_cap, tp, ta in reversed(ticks):
-                is_real = ta >= 0.99
-                if self.target_fps == 120 and tp > pair_id:
-                    continue  # 120Hz subframes still need the published pair
-                if is_real:
-                    if tp > frame_id:
-                        continue
-                    base_due = t_cap + 0.0005
-                    due = base_due  # no phase lock here: real frames want the *next* vblank
-                else:
-                    if tp > pair_id:
-                        continue  # this frame's flow isn't published yet
-                    base_due = flow_pub.get(tp, t_cap + base_delay)
-                    due = base_due + self.phase_adj
-                if due > t_sel:
-                    continue
-                a = ta
-                if self.target_fps == 120:
-                    # 120Hz: each tick splits into two 8.33ms sub-frames (0.25/0.5 then 0.75/1.0).
-                    a = ta - (0.0 if t_sel - due >= 0.00833 else 0.25)
-                if self.use_vblank and not is_real and (tp, a) != self.last_presented_signature:
-                    # phase lock: steer (vblank - due) toward half a refresh so capture jitter can't flip it
-                    P = self.vb_period
-                    err = (t_sel - due) % P - P / 2
-                    adj = self.phase_adj + 0.05 * err
-                    self.phase_adj = adj + P if adj < -0.004 else min(adj, P)
-                chosen_tick = (t_cap, tp, ta)
-                render_seq = tp
-                tick_sig = (tp, a)
-                alpha = a
-                if is_real:
+                due = t_cap + flow_delay
+                if tp > pair_id:
+                    continue  # this frame's flow isn't published yet; fall back to an older tick
+                if due <= t_sel:
+                    a = ta
                     if self.target_fps == 120:
+                        a = ta - (0.0 if t_sel - due >= 0.00833 else 0.25)
+                    if self.use_vblank and (tp, a) != self.last_presented_signature:
+                        P = self.vb_period
+                        err = (t_sel - due) % P - P / 2
+                        adj = self.phase_adj + 0.05 * err
+                        self.phase_adj = adj + P if adj < -0.004 else min(adj, P)
+                    alpha = a
+                    if tp < pair_id:
                         old = tp == pair_id - 1 and self.pp_valid
                         if not old:
-                            alpha = 0.0 if tp < pair_id else 1.0
-                    else:
-                        use_live = True
-                else:
-                    old = tp == pair_id - 1 and self.pp_valid
-                    if not old and tp < pair_id:
-                        alpha = 0.0
-                break
-            if chosen_tick is not None:
-                # Discard consumed ticks so a stale midpoint is never replayed after its real
-                # frame (that would show one picture twice and break the cadence).
-                with self.engine.lock:
-                    q = self.engine.ticks
-                    if any(t is chosen_tick for t in q):  # may have been evicted from the bounded deque
-                        while q and q[0] is not chosen_tick:
-                            q.popleft()
-            elif self.last_render is not None:
-                # Nothing due yet: hold the last presented frame rather than jumping ahead.
-                render_seq, alpha, old, use_live = self.last_render
-                tick_sig = (render_seq, alpha)
-            else:
-                use_live = True
+                            alpha = 0.0
+                    if ta >= 0.99:
+                        use_live = True  # real frame: skip flow, bind the freshly decoded texture
+                    tick_sig = (tp, a)
+                    break
         elif self.target_fps == 90:
             # 3x FrameGen (30 -> 90 FPS): 3-step cadence (11.1ms each: 0.33, 0.67, 1.0)
             if elapsed < 0.0111:
@@ -1243,7 +1205,6 @@ class FrameGenGLWidget(QOpenGLWidget):
             step = min(4, int(elapsed / 0.00833) + 1)
             alpha = step * 0.25
             use_live = alpha >= 0.99
-        self.last_render = (render_seq, alpha, old, use_live)
 
         # Track genuinely distinct visual frames presented to screen
         sig = tick_sig or (pair_id, round(alpha, 2))
