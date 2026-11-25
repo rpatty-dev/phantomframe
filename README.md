@@ -37,7 +37,7 @@
    curl -fsSL https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.sh | bash
    ```
 
-4. Click **Allow** when macOS asks to use the camera (the capture card counts as one). Next time, double-click **PhantomFrame** on your Desktop.
+4. Click **Allow** when macOS asks to use the camera (the capture card counts as one). Next time, double-click **Launch.command** in the **PhantomFrame** folder, or **PhantomFrame** on your Desktop.
 
 ### Then
 
