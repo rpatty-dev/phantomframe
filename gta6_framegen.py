@@ -13,6 +13,7 @@ import json
 import os
 import threading
 import ctypes
+import urllib.request
 from collections import deque
 import numpy as np
 import cv2
@@ -37,6 +38,65 @@ except Exception:
 
 # Mac keyboards have no Home key: "\\" opens settings there
 SETTINGS_KEY = "\\" if sys.platform == "darwin" else "HOME"
+
+APP_VERSION = "v1.2"
+REPO = "rpatty-dev/phantomframe"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+UPDATE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+INSTALLER = (f"https://raw.githubusercontent.com/{REPO}/main/install.ps1" if sys.platform == "win32"
+             else f"https://raw.githubusercontent.com/{REPO}/main/install.sh")
+
+
+def version_key(tag: str) -> tuple[int, ...]:
+    nums = tuple(int(n) for n in re.findall(r"\d+", tag))
+    return nums or (0,)
+
+
+def fetch_latest_version() -> str:
+    req = urllib.request.Request(UPDATE_API, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"PhantomFrame/{APP_VERSION}",
+    })
+    with urllib.request.urlopen(req, timeout=6) as response:
+        return str(json.load(response).get("tag_name", ""))
+
+
+def install_latest() -> None:
+    """Run the same installer as the README one-liner, without launching a second app."""
+    env = os.environ.copy()
+    env["PHANTOMFRAME_DIR"] = APP_DIR
+    env["PHANTOMFRAME_NO_LAUNCH"] = "1"
+    if sys.platform == "win32":
+        quoted = APP_DIR.replace("'", "''")
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+               f"$env:PHANTOMFRAME_DIR='{quoted}'; $env:PHANTOMFRAME_NO_LAUNCH='1'; irm {INSTALLER} | iex"]
+        result = subprocess.run(cmd, env=env, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=300,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    else:
+        cmd = ["bash", "-c", f"curl -fsSL {INSTALLER} | bash"]
+        result = subprocess.run(cmd, env=env, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=300)
+    if result.returncode:
+        raise RuntimeError((result.stdout or "installer failed").strip()[-300:])
+
+
+class UpdateChecker(QObject):
+    """Checks GitHub off the UI thread, then runs the README installer if a newer release exists."""
+    up_to_date = pyqtSignal()
+    installed = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def run(self) -> None:
+        try:
+            tag = fetch_latest_version()
+            if not tag or version_key(tag) <= version_key(APP_VERSION):
+                self.up_to_date.emit()
+                return
+            install_latest()
+            self.installed.emit(tag)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 def find_capture_card_index(preferred_name="USB Video") -> tuple[int, str, list[tuple[int, str]]]:
@@ -1125,6 +1185,7 @@ class GTA6FrameGenWindow(QMainWindow):
         self._build_top_osd()
         self._build_home_settings_panel()
         self._bind_shortcuts()
+        QTimer.singleShot(1200, self._auto_check_updates)
 
         self.engine.start()
         self.audio.start()
@@ -1344,6 +1405,19 @@ class GTA6FrameGenWindow(QMainWindow):
         self.chk_mute.toggled.connect(self._on_mute_toggled)
         layout.addWidget(self.chk_mute)
 
+        # Added last so existing settings.json QCheckBox indices stay valid.
+        self.chk_update = QCheckBox(f"Auto-update on startup (current {APP_VERSION})")
+        self.chk_update.setStyleSheet("background: transparent; border: none;")
+        self.chk_update.setChecked(True)
+        layout.addWidget(self.chk_update)
+
+        btn_update = QPushButton("Check for updates now")
+        btn_update.clicked.connect(self.check_updates)
+        layout.addWidget(btn_update)
+        self.update_status = QLabel("")
+        self.update_status.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(self.update_status)
+
         # 7. Bottom buttons
         btn_row = QHBoxLayout()
         btn_fs = QPushButton("Toggle Fullscreen (F)")
@@ -1481,6 +1555,27 @@ class GTA6FrameGenWindow(QMainWindow):
         self.audio.muted = checked
         self._update_telemetry()
 
+    def _auto_check_updates(self):
+        if self.chk_update.isChecked():
+            self.check_updates()
+
+    def check_updates(self):
+        # Source checkouts are updated with git; only installed copies self-update.
+        if os.path.isdir(os.path.join(APP_DIR, ".git")) or "--self-test" in sys.argv:
+            return
+        self.update_status.setText("Checking GitHub for updates...")
+        checker = UpdateChecker()
+        checker.up_to_date.connect(lambda: self.update_status.setText(f"Up to date ({APP_VERSION})"))
+        checker.installed.connect(self._on_update_installed)
+        checker.failed.connect(lambda err: self.update_status.setText(f"Update failed: {str(err)[:70]}"))
+        self._checker = checker
+        self._updater_thread = threading.Thread(target=checker.run, daemon=True)
+        self._updater_thread.start()
+
+    def _on_update_installed(self, tag: str):
+        self.update_status.setText(f"Installed {tag}. Restart PhantomFrame to use it.")
+        self._update_tag = tag
+
     def toggle_fullscreen(self):
         # Borderless window instead of showFullScreen(): true fullscreen makes Windows flip the GL surface
         # directly to the display, which Lossless Scaling's capture can't overlay.
@@ -1557,7 +1652,8 @@ class GTA6FrameGenWindow(QMainWindow):
         self.fps_label.setText(f"{eff_fps:.0f} FPS")
         self._place_fps_label()
         rec =f"[{self.engine.rec_status}] " if self.engine.rec_status else ""
-        self.setWindowTitle(f"{rec}GTA VI FrameGen — {eff_fps:.1f} FPS ({mode_str}) [Press {SETTINGS_KEY} for Settings]")
+        upd = f" [RESTART FOR {self._update_tag}]" if getattr(self, "_update_tag", None) else ""
+        self.setWindowTitle(f"{rec}GTA VI FrameGen — {eff_fps:.1f} FPS ({mode_str}) [Press {SETTINGS_KEY} for Settings]{upd}")
 
     def closeEvent(self, event):
         self.hud_timer.stop()
