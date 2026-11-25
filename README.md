@@ -27,9 +27,10 @@ irm https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.ps1 |
 curl -fsSL https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.sh | bash
 ```
 
-You don't need anything installed first: no git, no Python, no admin rights. The installer downloads PhantomFrame, sets up its own Python 3.12, installs ffmpeg when winget or Homebrew is available, adds a **PhantomFrame** shortcut to your Desktop and launches it. Run the same line again to update; your settings are kept.
+You don't need anything installed first: no git, no Python, no admin rights. The installer downloads PhantomFrame, sets up its own Python 3.12, installs ffmpeg when winget or Homebrew is available, puts it on your Desktop and launches it. Run the same line again to update; your settings are kept.
 
-Installs to `%LOCALAPPDATA%\PhantomFrame` on Windows and `~/PhantomFrame` on macOS.
+- **Windows:** installs to a **PhantomFrame** folder on your Desktop. Double-click **Launch.bat** in it to start PhantomFrame. It is also in the Start menu.
+- **macOS:** installs to `~/PhantomFrame`, with a **PhantomFrame** shortcut on your Desktop.
 
 Press **F11** for fullscreen and **HOME** (**`\`** on macOS) for settings.
 

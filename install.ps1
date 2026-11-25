@@ -10,7 +10,8 @@
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
     $Repo = 'rpatty-dev/phantomframe'
-    $Dir = if ($env:PHANTOMFRAME_DIR) { $env:PHANTOMFRAME_DIR } else { Join-Path $env:LOCALAPPDATA 'PhantomFrame' }
+    # GetFolderPath follows a Desktop moved into OneDrive
+    $Dir = if ($env:PHANTOMFRAME_DIR) { $env:PHANTOMFRAME_DIR } else { Join-Path ([Environment]::GetFolderPath('Desktop')) 'PhantomFrame' }
 
     function Say($m) { Write-Host "==> $m" -ForegroundColor Magenta }
     function Get-Zip($url, $dest) {
@@ -55,24 +56,17 @@
         winget install -e --id Gyan.FFmpeg --silent --accept-package-agreements --accept-source-agreements | Out-Host
     }
 
-    Say 'Adding Desktop and Start menu shortcuts'
+    Say 'Adding a Start menu shortcut'
     $pyw = Join-Path $Dir '.venv\Scripts\pythonw.exe'
     $app = '"' + (Join-Path $Dir 'gta6_framegen.py') + '"'
-    $shell = New-Object -ComObject WScript.Shell
-    $links = @(
-        (Join-Path ([Environment]::GetFolderPath('Desktop')) 'PhantomFrame.lnk'),
-        (Join-Path ([Environment]::GetFolderPath('Programs')) 'PhantomFrame.lnk')
-    )
-    foreach ($path in $links) {
-        $lnk = $shell.CreateShortcut($path)
-        $lnk.TargetPath = $pyw
-        $lnk.Arguments = $app
-        $lnk.WorkingDirectory = $Dir
-        $lnk.IconLocation = Join-Path $Dir 'assets\icon.ico'
-        $lnk.Save()
-    }
+    $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Programs')) 'PhantomFrame.lnk'))
+    $lnk.TargetPath = $pyw
+    $lnk.Arguments = $app
+    $lnk.WorkingDirectory = $Dir
+    $lnk.IconLocation = Join-Path $Dir 'assets\icon.ico'
+    $lnk.Save()
 
-    Say 'Installed. Use the PhantomFrame shortcut on your Desktop to run it later.'
+    Say "Installed to $Dir. Double-click Launch.bat there to run it later."
     if ($env:PHANTOMFRAME_NO_LAUNCH -ne '1') {
         Start-Process $pyw -ArgumentList $app -WorkingDirectory $Dir
     }
