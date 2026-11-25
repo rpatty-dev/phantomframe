@@ -855,8 +855,9 @@ class FrameGenGLWidget(QOpenGLWidget):
 
     def set_target_fps(self, fps: int):
         self.target_fps = int(fps)
-        # 4ms poll: 2ms (400Hz redraw) starved the flow/capture threads and cut on-time frames from 87% to ~50%
-        self.timer.setInterval(4)
+        # DWM path is vblank-driven. Without it, poll once per output frame: 4ms at 60Hz overpresents
+        # and flickers on macOS; 2ms starved the flow/capture threads on Windows.
+        self.timer.setInterval(4 if self.use_vblank else max(4, round(1000.0 / self.target_fps)))
         if not self.use_vblank and not self.timer.isActive():
             self.timer.start()
 
@@ -931,8 +932,9 @@ class FrameGenGLWidget(QOpenGLWidget):
     def resizeGL(self, w, h):
         dpr = self.devicePixelRatioF()
         pw, ph = round(w * dpr), round(h * dpr)
-        if pw >= 1920 and ph >= 1080:
-            # Pixel-exact 1:1 (no resample blur); top-aligned since borderless mode is 1px taller than the screen
+        if abs(pw - 1920) <= 2 and abs(ph - 1080) <= 2:
+            # Pixel-exact 1:1 only on a true 1080p backing store; DPR 2 would otherwise render
+            # into a quarter of the window. Borderless mode is 1px taller than the screen.
             self._viewport = ((pw - 1920) // 2, ph - 1080, 1920, 1080)
         else:
             self._viewport = (0, 0, pw, ph)
