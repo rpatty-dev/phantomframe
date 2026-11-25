@@ -43,7 +43,7 @@
 
 - **F11**: fullscreen
 - **HOME** (**`\`** on Mac): settings
-- To update, run the same line again. Your settings are kept.
+- Updates install automatically on launch. To force one, run the same line again. Your settings are kept.
 
 > You don't need git, Python or admin rights: the installer downloads everything it needs.
 > **Need:** Windows 10/11 or macOS · a USB HDMI capture card · any GPU with OpenGL 3.3.
@@ -60,8 +60,8 @@
 | **60 FPS from 30 FPS** | Every real frame gets a motion-compensated in-between frame, alternating exactly 1:1. |
 | **90 / 120 / 144 FPS targets** | 3x and 4x generation for high refresh monitors (120 is experimental). |
 | **Display-locked pacing** | Frames are presented on your monitor's own refresh (DWM vblank) instead of a timer, and a phase lock keeps each frame's deadline halfway between refreshes so capture jitter can't make it skip or double. |
-| **Adaptive delay** | The output waits just long enough for motion vectors to be ready (90th percentile of measured flow time, from 10 ms), so latency stays as low as your PC allows. |
-| **Fast** | DIS optical flow at 960×540 on its own thread (about 2–5 ms), frame building in a GPU shader. |
+| **Adaptive delay** | The output waits just long enough for motion vectors to be ready (90th percentile of measured flow time, from 7 ms), so latency stays as low as your PC allows. |
+| **Fast** | DIS optical flow at 640×360 on its own thread (about 1–2 ms), frame building in a GPU shader. |
 | **Two flow presets** | ULTRAFAST (~1.7 ms) or FAST HQ (~4.2 ms, finer edges). Denser flow patches give +0.15 dB at about +1 ms. |
 | **Two latency modes** | 16.6 ms hold interpolation (artifact free) or 0 ms hold hybrid extrapolation (instant). |
 | **Motion smoothing** | Motion vectors are blended with the previous frame's, so moving edges don't wobble. |
@@ -92,6 +92,7 @@
 | | |
 |---|---|
 | **Settings remember themselves** | Every control in the settings panel is saved to `settings.json` the moment you change it and restored on the next launch. |
+| **Auto updates** | GitHub is checked on launch; a newer release installs itself using the same one-line installer. Disable it in settings. |
 | **FPS counter** | Small top-right counter of the measured output FPS (`P` hides it). |
 | **Telemetry bar** | Capture rate, console FPS, flow time and render rate (`O`). Hidden by default. |
 | **Debug views** | Split screen (30 FPS vs generated) and an optical flow heatmap. |

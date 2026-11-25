@@ -47,7 +47,7 @@ def main():
         gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 1920, 1080, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, np.ascontiguousarray(a))
 
     def gray(a):  # same preprocessing as CaptureFlowEngine._flow_loop
-        return cv2.GaussianBlur(cv2.cvtColor(cv2.resize(a, (FW, FH), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY), (3, 3), 0)
+        return cv2.GaussianBlur(cv2.cvtColor(cv2.resize(a, (FW, FH), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2GRAY), (3, 3), 0)
 
     def render():
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
