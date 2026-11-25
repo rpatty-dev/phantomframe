@@ -26,17 +26,69 @@ That's it. Press **F11** for fullscreen and **HOME** for settings.
 
 ## 🌴 What you get
 
+### Frame generation
+
 | | |
 |---|---|
 | **60 FPS from 30 FPS** | Every real frame gets a motion-compensated in-between frame, alternating exactly 1:1. |
-| **Locked frame pacing** | Output is clocked by the capture card's own 60 Hz signal, so frames land on schedule rather than "about 60 on average". |
-| **120 FPS mode** *(experimental)* | 3 generated frames per real frame, for 120 Hz monitors. |
-| **Fast** | Motion estimation takes about 5 ms on its own thread, and the frame building runs in a GPU shader. |
-| **Image cleanup** | Removes USB capture-card compression blocks, noise and banding, then sharpens without halos. |
-| **Vignette removal** | Undoes GTA VI's heavy screen-edge darkening, using a curve measured from real gameplay. Adjustable in settings. |
-| **HUD-safe** | Minimap, crosshair and subtitles are protected from warping. |
-| **Motion blur and smoothing** | An adjustable, cinematic look. Both can be turned off. |
-| **Low-latency audio** | Passes capture-card audio straight to your speakers. |
+| **90 / 120 / 144 FPS targets** | 3x and 4x generation for high refresh monitors (120 is experimental). |
+| **Display-locked pacing** | Frames are presented on your monitor's own refresh (DWM vblank) instead of a timer, and a phase lock keeps each frame's deadline halfway between refreshes so capture jitter can't make it skip or double. |
+| **Adaptive delay** | The output waits just long enough for motion vectors to be ready (90th percentile of measured flow time, from 10 ms), so latency stays as low as your PC allows. |
+| **Fast** | DIS optical flow at 960×540 on its own thread (about 2–5 ms), frame building in a GPU shader. |
+| **Two flow presets** | ULTRAFAST (~1.7 ms) or FAST HQ (~4.2 ms, finer edges). Denser flow patches give +0.15 dB at about +1 ms. |
+| **Two latency modes** | 16.6 ms hold interpolation (artifact free) or 0 ms hold hybrid extrapolation (instant). |
+| **Motion smoothing** | Motion vectors are blended with the previous frame's, so moving edges don't wobble. |
+| **Motion blur** | Adjustable shutter blur along the motion, for a cinematic look. |
+
+### Made for GTA VI
+
+| | |
+|---|---|
+| **Vignette removal** | Undoes GTA VI's heavy screen-edge darkening with a curve fitted on tracked points across camera pans in real gameplay. Bright sky and water near the edges are eased off so they don't wash out to white. |
+| **Minimap kept true** | The minimap is drawn on top of the game's vignette, so vignette removal leaves it alone. Because the map rotates, it is crossfaded instead of warped: the best of 10 methods tested (+1.7 dB on the map, no added latency). |
+| **HUD & text lock** | Crosshair, HUD and subtitles are detected and protected from warping, so text never smears. |
+| **Clarity / dehaze** | Local contrast in the midtones cuts through Leonida's humid haze without crushing shadows. |
+| **Vibrance** | Lifts dull colours more than already saturated ones, so skin tones stay natural. |
+| **Contrast** | Optional S-curve for deeper shadows and brighter highlights. |
+| **Before / after** | Press `B` to split the screen: the left half shows the image without vignette removal and grading. |
+
+### Picture cleanup
+
+| | |
+|---|---|
+| **Capture card cleanup** | A per-frame pass removes MJPEG 8×8 blocking, mosquito noise and smeared colour (colour is rebuilt along luma edges, because MJPEG stores it at reduced resolution). |
+| **No flicker** | The cleanup runs once per captured frame, before generation, so real and generated frames get exactly the same cleaned image. |
+| **Edge-safe sharpening** | Contrast adaptive sharpening that backs off around text and hard edges. Off by default, since the cleanup pass already gives a clean image. |
+
+### Quality of life
+
+| | |
+|---|---|
+| **Settings remember themselves** | Every control in the settings panel is saved to `settings.json` the moment you change it and restored on the next launch. |
+| **FPS counter** | Small top-right counter of the measured output FPS (`P` hides it). |
+| **Telemetry bar** | Capture rate, console FPS, flow time and render rate (`O`). Hidden by default. |
+| **Debug views** | Split screen (30 FPS vs generated) and an optical flow heatmap. |
+| **Low-latency audio** | Capture card audio straight to your speakers, with output device switching. |
+| **Clip recording** | Record an 8 s clip to `recordings/` for benchmarking. |
+
+### Defaults
+
+Tuned on real GTA VI gameplay. Change anything with `HOME`; your changes are kept.
+
+| Setting | Default |
+|---|---|
+| Target | 60 FPS (2x) |
+| Mode | Frame Generation (Full) |
+| Latency | 16.6 ms hold interpolation |
+| Flow | ULTRAFAST |
+| Sharpness | 0% |
+| Motion blur | 22% |
+| Remove game vignette | 100% |
+| Clarity / dehaze | 33% |
+| Vibrance | 75% |
+| Contrast | 1% |
+| Motion smoothing, HUD & text lock | on |
+| Telemetry bar | off |
 
 ---
 
@@ -44,8 +96,17 @@ That's it. Press **F11** for fullscreen and **HOME** for settings.
 
 | Key | Action |
 |---|---|
-| `HOME` | Settings: target FPS, mode, motion blur, sharpness, smoothing, vignette removal |
-| `F11` | Borderless fullscreen (works with overlays) |
+| `HOME` | Settings panel |
+| `F11` / `F` | Borderless fullscreen (works with overlays) |
+| `Space` | Frame generation on / off |
+| `Tab` | Cycle mode: frame generation, raw passthrough, split screen, flow heatmap |
+| `E` | Switch latency mode (hold interpolation / 0 ms extrapolation) |
+| `Q` | Switch flow preset (ULTRAFAST / FAST HQ) |
+| `S` | Cycle sharpness (0, 25, 45, 75, 100%) |
+| `H` | HUD & text lock on / off |
+| `B` | Before / after split |
+| `P` | FPS counter on / off |
+| `O` | Telemetry bar on / off |
 | `R` | Record an 8 s test clip to `recordings/` |
 | `M` | Mute audio |
 | `A` | Cycle audio output device |
@@ -73,9 +134,11 @@ That's it. Press **F11** for fullscreen and **HOME** for settings.
               Tick scheduler ◄──────── motion vectors ─────────┘
                      │   shows each tick after an adaptive delay (p90 flow latency)
                      ▼
-           GPU shader: re-anchor vectors at the in-between moment → warp both frames toward it
-                       → protect the HUD → motion blur → deblock / denoise / deband → sharpen
+   on upload: deblock → denoise → colour edge rebuild (same clean image for real and generated frames)
                      ▼
+           GPU shader: re-anchor vectors at the in-between moment → warp both frames toward it
+                       → protect HUD & minimap → motion blur → sharpen → vignette removal → grading
+                     ▼   presented on the display's vblank, phase locked
                  60 FPS on screen
 ```
 
@@ -95,6 +158,7 @@ Each unique frame from the console gives one **generated midpoint** tick, and ea
 
 ```powershell
 python tools/bench.py recordings/clip_XXXX.npy
+$env:PRESET=1; python tools/bench.py recordings/clip_XXXX.npy   # score the FAST HQ flow preset
 ```
 
 Press `R` in the app to record your own clip.
@@ -106,7 +170,10 @@ Press `R` in the app to record your own clip.
 ```powershell
 python gta6_framegen.py          # PhantomFrame frame generation (60 FPS default)
 python gta6_framegen.py --lsfg   # clean 30 FPS passthrough, for use with Lossless Scaling's LSFG
+python gta6_framegen.py --self-test   # 4 s check that capture, shaders and rendering work
 ```
+
+With `--lsfg` the picture still gets the cleanup, vignette removal and grading, with motion blur off. Click the window, press `F11`, then start LSFG in Lossless Scaling. The FPS counter is hidden there because Lossless Scaling draws its own.
 
 ---
 

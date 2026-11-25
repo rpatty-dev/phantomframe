@@ -9,13 +9,15 @@ import sys
 import time
 import subprocess
 import re
+import json
+import os
 import threading
 import ctypes
 from collections import deque
 import numpy as np
 import cv2
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QSurfaceFormat, QKeySequence, QShortcut, QCursor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -231,6 +233,7 @@ class CaptureFlowEngine:
         preset = cv2.DISOPTICAL_FLOW_PRESET_FAST if self.flow_preset == 1 else cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST
         dis = cv2.DISOpticalFlow_create(preset)
         dis.setUseSpatialPropagation(True)
+        dis.setPatchStride(3)  # denser patches: +0.15dB, +1ms (bench on 2 driving clips)
         return dis
 
     def _loop(self):
@@ -351,7 +354,7 @@ class CaptureFlowEngine:
 
             # Display delay = p90 capture->publish latency + margin, so ticks are never shown before their frame
             lat.append(time.perf_counter() - t_cap)
-            self.flow_delay = float(np.clip(np.percentile(lat, 90) + 0.003, 0.016, 0.035))
+            self.flow_delay = float(np.clip(np.percentile(lat, 90) + 0.003, 0.010, 0.035))
 
 
 VERTEX_SHADER = """
@@ -378,10 +381,10 @@ uniform int u_smooth;             // 1 = motion smoothing on
 
 const vec2 FLOW_RES = vec2(960.0, 540.0);
 
-// Raw flow -> UV units, with a ~1.2px@1080p deadzone so MJPEG noise never becomes motion
+// Raw flow -> UV units, with a ~0.6px@1080p deadzone so MJPEG noise never becomes motion
 vec2 rawFlow(sampler2D t, vec2 p) {
     vec2 f = texture(t, p).rg;
-    return dot(f, f) < 0.36 ? vec2(0.0) : f / FLOW_RES;
+    return dot(f, f) < 0.09 ? vec2(0.0) : f / FLOW_RES;
 }
 
 // Flow re-anchored at the in-between frame (v = F(p - v/2)), since synthesis samples flow at the
@@ -393,7 +396,7 @@ vec2 flowAt(vec2 p) {
         vec2 o = rawFlow(u_texFlowPrev, p - 0.5 * f);
         vec2 d = abs(f - o) * FLOW_RES;
         vec2 a = abs(f) * FLOW_RES;
-        if (d.x + d.y < 0.5 * (a.x + a.y) + 0.77) f = 0.6 * f + 0.4 * o;
+        if (d.x + d.y < 0.5 * (a.x + a.y) + 0.77) f = 0.8 * f + 0.2 * o;
     }
     return f;
 }
@@ -407,13 +410,55 @@ uniform float u_blur;        // Motion blur shutter (0 = off .. 1 = full output-
 uniform float u_frameStep;   // Fraction of a console frame per output frame (0.5 at 60, 0.25 at 120)
 uniform float u_devig;       // 0..1 strength of game-vignette removal
 
+uniform float u_clarity;     // local contrast / dehaze (0..1)
+uniform float u_vibrance;    // saturation boost for dull colors (0..1)
+uniform float u_contrast;    // S-curve (0..1)
+uniform int u_compare;       // 1 = left half shows the image without vignette removal + grading
+
+float lumaOf(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+vec3 grade(vec3 c, vec2 uv) {
+    // Clarity/dehaze: push each pixel away from its local mean (mip level 5 = ~32px area), midtones only
+    if (u_clarity > 0.0) {
+        float l = lumaOf(c);
+        float lm = lumaOf(textureLod(u_texCurr, uv, 5.0).rgb);
+        c += u_clarity * 0.9 * (l - lm) * (1.0 - abs(2.0 * l - 1.0));
+    }
+    // Contrast: blend toward a smoothstep S-curve (deeper shadows, brighter highlights)
+    if (u_contrast > 0.0) {
+        vec3 x = clamp(c, 0.0, 1.0);
+        c = mix(c, x * x * (3.0 - 2.0 * x), u_contrast * 0.5);
+    }
+    // Vibrance: saturate dull colors more than already-saturated ones (keeps skin natural)
+    if (u_vibrance > 0.0) {
+        float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+        c = mix(vec3(lumaOf(c)), c, 1.0 + u_vibrance * 0.6 * (1.0 - sat));
+    }
+    return clamp(c, 0.0, 1.0);
+}
+
 // Undo the game's vignette. Fitted on tracked points across camera pans in recorded GTA VI gameplay:
 // linear-light gain V = 1 - 0.75 * r^2, r = 0 center .. 1 corner, elliptical in screen space.
 vec3 devignette(vec3 c, vec2 uv) {
     if (u_devig <= 0.0) return c;
     vec2 d = uv - 0.5;
-    float v = 1.0 - u_devig * 0.75 * dot(d, d) * 2.0;
-    return clamp(pow(pow(c, vec3(2.2)) / max(v, 0.25), vec3(1.0 / 2.2)), 0.0, 1.0);
+    float v = 1.0 - 0.75 * dot(d, d) * 2.0;
+    float gain = mix(1.0, 1.0 / max(v, 0.25), u_devig);
+    // Ease off on highlights: full gain pushed bright sky/water near the edges to white (washed-out look)
+    gain = mix(gain, 1.0, smoothstep(0.55, 0.95, dot(c, vec3(0.299, 0.587, 0.114))));
+    // Minimap (bottom-left) is drawn on top of the game's vignette, so it must not be brightened
+    vec2 m = smoothstep(vec2(0.03, 0.70), vec2(0.06, 0.73), uv) * (1.0 - smoothstep(vec2(0.26, 0.95), vec2(0.29, 0.98), uv));
+    gain = mix(gain, 1.0, m.x * m.y);
+    return clamp(pow(pow(c, vec3(2.2)) * gain, vec3(1.0 / 2.2)), 0.0, 1.0);
+}
+
+// Final look: vignette removal + grade, or the untouched image on the left half in compare mode
+vec3 finish(vec3 c, vec2 uv) {
+    if (u_compare == 1) {
+        if (abs(uv.x - 0.5) < 0.0006) return vec3(1.0);
+        if (uv.x < 0.5) return c;
+    }
+    return grade(devignette(c, uv), uv);
 }
 
 float getLuma(vec3 c) {
@@ -433,43 +478,14 @@ float textEdgeStrength(sampler2D tex, vec2 uv, vec3 center) {
 }
 
 // Contrast Adaptive Sharpening (CAS) with automatic anti-ringing suppression around text/high-contrast edges
-// MJPEG deblock: soften only small steps across the 8x8 block grid; real edges (big steps) are left alone
-vec3 deblock(sampler2D tex, vec2 uv, vec3 c) {
-    vec2 m = mod(floor(uv / u_texelSize), 8.0);
-    vec3 r = c;
-    if (m.x == 7.0 || m.x == 0.0) {
-        vec3 o = texture(tex, uv + vec2(m.x == 7.0 ? u_texelSize.x : -u_texelSize.x, 0.0)).rgb;
-        r = mix(r, o, 0.3 * (1.0 - smoothstep(0.02, 0.09, length(o - c))));
-    }
-    if (m.y == 7.0 || m.y == 0.0) {
-        vec3 o = texture(tex, uv + vec2(0.0, m.y == 7.0 ? u_texelSize.y : -u_texelSize.y)).rgb;
-        r = mix(r, o, 0.3 * (1.0 - smoothstep(0.02, 0.09, length(o - c))));
-    }
-    return r;
-}
-
 vec3 applyCAS(sampler2D tex, vec2 uv, vec3 center, float amt) {
-    center = deblock(tex, uv, center);
+    // Deblock/denoise/color rebuild already ran in the per-frame prefilter pass (PREFILTER_FS)
     vec2 ts = u_texelSize;
     vec3 n = texture(tex, uv + vec2(0.0, -ts.y)).rgb;
     vec3 s = texture(tex, uv + vec2(0.0,  ts.y)).rgb;
     vec3 w = texture(tex, uv + vec2(-ts.x, 0.0)).rgb;
     vec3 e = texture(tex, uv + vec2( ts.x, 0.0)).rgb;
-    vec3 nw = texture(tex, uv + vec2(-ts.x, -ts.y)).rgb;
-    vec3 ne = texture(tex, uv + vec2( ts.x, -ts.y)).rgb;
-    vec3 sw = texture(tex, uv + vec2(-ts.x,  ts.y)).rgb;
-    vec3 se = texture(tex, uv + vec2( ts.x,  ts.y)).rgb;
-
-    // 1. Edge-preserving (bilateral) denoise: removes MJPEG mosquito noise, keeps real edges
-    float lc = getLuma(center);
-    vec3 acc = center; float wsum = 1.0;
-    vec3 q[8] = vec3[8](n, s, w, e, nw, ne, sw, se);
-    for (int i = 0; i < 8; i++) {
-        float d = getLuma(q[i]) - lc;
-        float wq = exp(-d * d * 400.0) * (i < 4 ? 0.6 : 0.35);   // sigma ~0.035 luma
-        acc += q[i] * wq; wsum += wq;
-    }
-    vec3 den = mix(center, acc / wsum, 0.6);
+    vec3 den = center;
 
     // 2. Deband: flat areas (skies, dark gradients) get a wide average + dither to hide 8-bit/MJPEG steps
     float h = fract(sin(dot(uv, vec2(12.9898, 78.233))) * 43758.5453);
@@ -527,6 +543,11 @@ vec3 synthesizeFrame(vec2 uv, float t) {
     if (t >= 0.99) return applyCAS(u_texCurr, uv, rawCurr, u_sharpness);
     if (t <= 0.01) return applyCAS(u_texPrev, uv, rawPrev, u_sharpness);
 
+    // Minimap (bottom-left): plain crossfade, no warp. Its rotation breaks the flow; benchmarked
+    // as the best of 10 methods (+1.7dB on the map, +0.05dB overall, zero extra latency)
+    if (u_hudProtect == 1 && uv.x > 0.047 && uv.x < 0.276 && uv.y > 0.676 && uv.y < 0.958)
+        return mix(rawPrev, rawCurr, t);
+
     // Check HUD & Text lock first
     float lockAmt = hudAndTextLock(uv, rawPrev, rawCurr);
     if (lockAmt >= 0.96) {
@@ -578,7 +599,7 @@ vec3 hsv2rgb(vec3 c) {
 void main() {
     if (u_mode == 1) {
         vec3 c = texture(u_texCurr, v_uv).rgb;
-        fragColor = vec4(devignette(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
+        fragColor = vec4(finish(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
         return;
     }
     if (u_mode == 3) {
@@ -611,9 +632,9 @@ void main() {
         }
         if (v_uv.x < 0.5) {
             vec3 c = texture(u_texCurr, v_uv).rgb;
-            fragColor = vec4(devignette(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
+            fragColor = vec4(finish(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
         } else {
-            fragColor = vec4(devignette(synthesizeFrame(v_uv, u_alpha), v_uv), 1.0);
+            fragColor = vec4(finish(synthesizeFrame(v_uv, u_alpha), v_uv), 1.0);
         }
         return;
     }
@@ -641,9 +662,70 @@ void main() {
             col = mix(acc / 9.0, col, keep);
         }
     }
-    fragColor = vec4(devignette(col, v_uv), 1.0);
+    fragColor = vec4(finish(col, v_uv), 1.0);
 }
 """
+
+
+# Per-frame cleanup pass, run once when a captured frame is uploaded, so real AND generated frames
+# share the same cleaned image (doing it in the output shader made generated frames differ -> flicker)
+PREFILTER_VS = """
+#version 330 core
+out vec2 uv;
+void main() {
+    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    uv = pos;  // no flip: FBO row r <-> texture row r
+    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+PREFILTER_FS = """
+#version 330 core
+in vec2 uv;
+out vec4 o;
+uniform sampler2D u_src;
+uniform vec2 u_texel;
+
+float Y(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+vec3 at(vec2 d) { return texture(u_src, uv + d * u_texel).rgb; }
+
+void main() {
+    vec3 c = at(vec2(0.0));
+    // 1. MJPEG deblock: soften only small steps across the 8x8 block grid; real edges are left alone
+    vec2 m = mod(floor(uv / u_texel), 8.0);
+    if (m.x == 7.0 || m.x == 0.0) {
+        vec3 q = at(vec2(m.x == 7.0 ? 1.0 : -1.0, 0.0));
+        c = mix(c, q, 0.3 * (1.0 - smoothstep(0.02, 0.09, length(q - c))));
+    }
+    if (m.y == 7.0 || m.y == 0.0) {
+        vec3 q = at(vec2(0.0, m.y == 7.0 ? 1.0 : -1.0));
+        c = mix(c, q, 0.3 * (1.0 - smoothstep(0.02, 0.09, length(q - c))));
+    }
+    // 2. Bilateral denoise (mosquito noise, 3x3) + 3. color edge rebuild (5x5): MJPEG stores color at
+    // reduced resolution, so average chroma only from neighbors with matching luma -> color snaps to edges
+    float lc = Y(c);
+    vec3 acc = c; float ws = 1.0;
+    vec3 chr = c - lc; float wc = 1.0;
+    for (int y = -2; y <= 2; y++)
+        for (int x = -2; x <= 2; x++) {
+            if (x == 0 && y == 0) continue;
+            vec3 q = at(vec2(x, y));
+            float d = Y(q) - lc;
+            if (abs(x) <= 1 && abs(y) <= 1) {
+                float wq = exp(-d * d * 400.0) * (abs(x) + abs(y) == 1 ? 0.6 : 0.35);
+                acc += q * wq; ws += wq;
+            }
+            float wk = exp(-d * d * 2500.0);   // tight luma match for chroma
+            chr += (q - Y(q)) * wk; wc += wk;
+        }
+    vec3 den = mix(c, acc / ws, 0.6);
+    o = vec4(Y(den) + chr / wc, 1.0);
+}
+"""
+
+
+class _VBlank(QObject):
+    tick = pyqtSignal()
 
 
 class FrameGenGLWidget(QOpenGLWidget):
@@ -667,9 +749,13 @@ class FrameGenGLWidget(QOpenGLWidget):
         self.target_fps = 60           # 30, 60, 90, 120, 144
         self.zero_hold_extrap = False  # False = Interpolation, True = 0ms Hold Hybrid Extrapolation
         self.hud_protect = True
-        self.motion_blur = 0.5         # 180-degree-style shutter by default
-        self.devignette = 1.0          # remove the game's vignette (0..1)
-        self.sharpness = 0.5          # Lower default (25%) + text-edge suppression eliminates MJPEG text noise
+        self.motion_blur = 0.22        # light shutter blur
+        self.devignette = 1.0          # remove the game's vignette (0..1); highlights are eased so it doesn't wash out
+        self.clarity = 0.33            # local contrast / dehaze
+        self.vibrance = 0.75
+        self.contrast = 0.01
+        self.compare = False           # [B] left half = before grading
+        self.sharpness = 0.0          # off by default (tuned); the prefilter already cleans MJPEG
 
         # Telemetry verification counters: track distinct presented frames (real vs synthesized)
         self.render_times = deque(maxlen=140)
@@ -683,13 +769,40 @@ class FrameGenGLWidget(QOpenGLWidget):
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.update)
+        # Repaint once per display refresh (DwmFlush blocks until the next DWM vblank) instead of a 4ms poll:
+        # removes up to 4ms of present jitter and frees CPU for the capture/flow threads
+        try:
+            self.use_vblank = ctypes.windll.dwmapi.DwmFlush() == 0
+        except Exception:
+            self.use_vblank = False
+        self.vblank_t = time.perf_counter()
+        self.vb_period = 1 / 60
+        self.phase_adj = 0.0  # extra tick delay that keeps deadlines mid-way between vblanks (no flip-flopping)
+        if self.use_vblank:
+            self._vb = _VBlank()
+            self._vb.tick.connect(self.update)
+            threading.Thread(target=self._vblank_loop, daemon=True).start()
         self.set_target_fps(60)
+
+    def _vblank_loop(self):
+        flush = ctypes.windll.dwmapi.DwmFlush
+        last = time.perf_counter()
+        while True:
+            flush()
+            t = time.perf_counter()
+            if 0.004 < t - last < 0.040:
+                self.vb_period += 0.02 * ((t - last) - self.vb_period)
+            self.vblank_t = last = t
+            try:
+                self._vb.tick.emit()
+            except RuntimeError:
+                return  # widget closed
 
     def set_target_fps(self, fps: int):
         self.target_fps = int(fps)
         # 4ms poll: 2ms (400Hz redraw) starved the flow/capture threads and cut on-time frames from 87% to ~50%
         self.timer.setInterval(4)
-        if not self.timer.isActive():
+        if not self.use_vblank and not self.timer.isActive():
             self.timer.start()
 
     def initializeGL(self):
@@ -704,14 +817,44 @@ class FrameGenGLWidget(QOpenGLWidget):
         gl.glBindVertexArray(self.vao)
 
         # Frame before tex_prev: lets the previous pair's last sub-frames finish after the next pair arrives
+        self.pre_program = shaders.compileProgram(
+            shaders.compileShader(PREFILTER_VS, gl.GL_VERTEX_SHADER),
+            shaders.compileShader(PREFILTER_FS, gl.GL_FRAGMENT_SHADER), validate=False)
+        self.pre_fbo = gl.glGenFramebuffers(1)
+        self.tex_raw = self._create_texture(1920, 1080, gl.GL_RGBA8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
         self.tex_pp = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
         self.pp_valid = False
         self.tex_prev = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
         self.tex_curr = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
+        for t in (self.tex_pp, self.tex_prev, self.tex_curr):
+            gl.glBindTexture(gl.GL_TEXTURE_2D, t)
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, 1920, 1080, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
+            gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
         self.tex_flow, self.tex_flow_prev = (self._create_texture(
             CaptureFlowEngine.FLOW_W, CaptureFlowEngine.FLOW_H,
             gl.GL_RG32F, gl.GL_RG, gl.GL_FLOAT
         ) for _ in range(2))
+
+    def _prefilter(self, frame, target):
+        # Upload a captured BGR frame and write its cleaned version (+ mipmaps) into target
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_raw)
+        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 1920, 1080, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, frame)
+        vp = gl.glGetIntegerv(gl.GL_VIEWPORT)
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.pre_fbo)
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, target, 0)
+        gl.glViewport(0, 0, 1920, 1080)
+        gl.glUseProgram(self.pre_program)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_raw)
+        gl.glUniform1i(gl.glGetUniformLocation(self.pre_program, "u_src"), 0)
+        gl.glUniform2f(gl.glGetUniformLocation(self.pre_program, "u_texel"), 1.0 / 1920.0, 1.0 / 1080.0)
+        gl.glBindVertexArray(self.vao)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, target)
+        gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        gl.glViewport(*vp)
 
     def _create_texture(self, w, h, internal_fmt, pix_fmt, dtype):
         tex = gl.glGenTextures(1)
@@ -758,10 +901,8 @@ class FrameGenGLWidget(QOpenGLWidget):
                 self.tex_pp, self.tex_prev, self.tex_curr = self.tex_prev, self.tex_curr, self.tex_pp
             self.pp_valid = consecutive
             if not consecutive:
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_prev)
-                gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 1920, 1080, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, f_prev)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_curr)
-            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 1920, 1080, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, f_curr)
+                self._prefilter(f_prev, self.tex_prev)
+            self._prefilter(f_curr, self.tex_curr)
             self.tex_flow, self.tex_flow_prev = self.tex_flow_prev, self.tex_flow  # keep last flow for smoothing
             gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_flow)
             gl.glTexSubImage2D(
@@ -787,15 +928,22 @@ class FrameGenGLWidget(QOpenGLWidget):
             # after capture so the 5-6ms flow compute on unique frames doesn't skew the cadence.
             # 120 (experimental): each tick splits into two 8.33ms sub-frames (0.25/0.5 then 0.75/1.0).
             alpha, tick_sig = 1.0, (pair_id, 1.0)
-            flow_delay = self.engine.flow_delay
+            flow_delay = self.engine.flow_delay + self.phase_adj
+            t_sel = self.vblank_t if self.use_vblank else t_now
             for t_cap, tp, ta in reversed(ticks):
                 due = t_cap + flow_delay  # adaptive: p90 capture->flow-publish latency
                 if tp > pair_id:
                     continue  # this frame's flow isn't published yet; fall back to an older tick
-                if due <= t_now:
+                if due <= t_sel:
                     a = ta
                     if self.target_fps == 120:
-                        a = ta - (0.0 if t_now - due >= 0.00833 else 0.25)
+                        a = ta - (0.0 if t_sel - due >= 0.00833 else 0.25)
+                    if self.use_vblank and (tp, a) != self.last_presented_signature:
+                        # phase lock: steer (vblank - due) toward half a refresh so capture jitter can't flip it
+                        P = self.vb_period
+                        err = (t_sel - due) % P - P / 2
+                        adj = self.phase_adj + 0.05 * err
+                        self.phase_adj = adj + P if adj < -0.004 else min(adj, P)  # wrap one refresh, never wait > 4ms less
                     alpha = a
                     if tp < pair_id:
                         # Tick from the previous pair: finish it on the kept textures, else show its
@@ -862,6 +1010,10 @@ class FrameGenGLWidget(QOpenGLWidget):
         gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_blur"), float(self.motion_blur))
         gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_frameStep"), 30.0 / max(30, self.target_fps))
         gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_devig"), float(self.devignette))
+        gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_clarity"), float(self.clarity))
+        gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_vibrance"), float(self.vibrance))
+        gl.glUniform1f(gl.glGetUniformLocation(self.program, "u_contrast"), float(self.contrast))
+        gl.glUniform1i(gl.glGetUniformLocation(self.program, "u_compare"), 1 if self.compare else 0)
 
         gl.glBindVertexArray(self.vao)
         gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
@@ -922,6 +1074,18 @@ class GTA6FrameGenWindow(QMainWindow):
         self.osd_label.resize(1180, 46)
         self.osd_label.show()
 
+        # Tiny measured-FPS counter, top-right ([P] toggles)
+        self.fps_label = QLabel("-- FPS", self)
+        self.fps_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.fps_label.setStyleSheet(
+            "QLabel { background-color: rgba(12, 12, 20, 150); color: #3EE7FF; border-radius: 4px;"
+            " padding: 1px 6px; font-family: 'Consolas', monospace; font-size: 11px; font-weight: bold; }")
+        self.fps_label.show()
+
+    def _place_fps_label(self):
+        self.fps_label.adjustSize()
+        self.fps_label.move(self.width() - self.fps_label.width() - 10, 8)
+
     def _build_home_settings_panel(self):
         """Interactive [Home] settings overlay modal."""
         self.settings_panel = QFrame(self)
@@ -959,15 +1123,16 @@ class GTA6FrameGenWindow(QMainWindow):
                 font-weight: 600;
                 spacing: 8px;
             }
+            QSlider { background: transparent; border: none; min-height: 22px; }
             QCheckBox::indicator {
                 width: 18px;
                 height: 18px;
             }
         """)
-        self.settings_panel.setFixedSize(460, 440)
+        self.settings_panel.setFixedWidth(500)  # height follows content (fixed height crushed the combos)
         layout = QVBoxLayout(self.settings_panel)
         layout.setContentsMargins(22, 18, 22, 18)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         title = QLabel("GTA VI FRAMEGEN — SETTINGS [HOME]")
         title.setStyleSheet("color: #FF3E9D; font-size: 16px; font-weight: bold; letter-spacing: 1px;")
@@ -1029,21 +1194,21 @@ class GTA6FrameGenWindow(QMainWindow):
 
         # 5. Sharpness Slider (Edge-Safe CAS)
         row_sharp = QHBoxLayout()
-        self.lbl_sharp = QLabel("Edge-Safe Sharpness (CAS): 50%")
+        self.lbl_sharp = QLabel("Edge-Safe Sharpness (CAS): 0%")
         row_sharp.addWidget(self.lbl_sharp)
         self.slider_sharp = QSlider(Qt.Orientation.Horizontal)
         self.slider_sharp.setRange(0, 100)
-        self.slider_sharp.setValue(50)
+        self.slider_sharp.setValue(0)
         self.slider_sharp.valueChanged.connect(self._on_sharp_slider)
         row_sharp.addWidget(self.slider_sharp)
         layout.addLayout(row_sharp)
 
         row_blur = QHBoxLayout()
-        self.lbl_blur = QLabel("Motion Blur: 50%")
+        self.lbl_blur = QLabel("Motion Blur: 22%")
         row_blur.addWidget(self.lbl_blur)
         self.slider_blur = QSlider(Qt.Orientation.Horizontal)
         self.slider_blur.setRange(0, 100)
-        self.slider_blur.setValue(50)
+        self.slider_blur.setValue(22)
         self.slider_blur.valueChanged.connect(self._on_blur_slider)
         row_blur.addWidget(self.slider_blur)
         layout.addLayout(row_blur)
@@ -1057,6 +1222,19 @@ class GTA6FrameGenWindow(QMainWindow):
         self.slider_vig.valueChanged.connect(self._on_vig_slider)
         row_vig.addWidget(self.slider_vig)
         layout.addLayout(row_vig)
+
+        for attr, label, default in (("clarity", "Clarity / Dehaze", 33), ("vibrance", "Vibrance", 75),
+                                     ("contrast", "Contrast", 1)):
+            row = QHBoxLayout()
+            lbl = QLabel(f"{label}: {default}%")
+            row.addWidget(lbl)
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(0, 100)
+            sl.setValue(default)
+            sl.valueChanged.connect(lambda v, a=attr, l=lbl, t=label: (
+                setattr(self.gl_widget, a, v / 100.0), l.setText(f"{t}: {v}%")))
+            row.addWidget(sl)
+            layout.addLayout(row)
 
         self.chk_smooth = QCheckBox("Motion Smoothing (temporal vector smoothing)")
         self.chk_smooth.setStyleSheet("background: transparent; border: none;")
@@ -1075,6 +1253,7 @@ class GTA6FrameGenWindow(QMainWindow):
         self.chk_osd.setStyleSheet("background: transparent; border: none;")
         self.chk_osd.setChecked(True)
         self.chk_osd.toggled.connect(self.osd_label.setVisible)
+        self.chk_osd.setChecked(False)  # clean picture by default; O or this box shows the bar
         layout.addWidget(self.chk_osd)
 
         self.chk_mute = QCheckBox("Mute Capture Card Audio (Shortcut: M)")
@@ -1093,12 +1272,43 @@ class GTA6FrameGenWindow(QMainWindow):
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
+        self.settings_panel.adjustSize()
         self.settings_panel.hide()
+        self._init_autosave()
+
+    def _init_autosave(self):
+        """Restore every panel control from settings.json and save it again whenever one changes."""
+        if "--self-test" in sys.argv:
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+        kinds = ((QComboBox, "currentIndex", "setCurrentIndex", "currentIndexChanged"),
+                 (QSlider, "value", "setValue", "valueChanged"),
+                 (QCheckBox, "isChecked", "setChecked", "toggled"))
+        ctrls = [(f"{cls.__name__}{i}", w, get, set_, sig) for cls, get, set_, sig in kinds
+                 for i, w in enumerate(self.settings_panel.findChildren(cls))]
+        try:
+            with open(path, encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            saved = {}
+        for key, w, _, set_, _ in ctrls:
+            if key in saved:
+                getattr(w, set_)(saved[key])
+
+        def save(*_):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({k: getattr(w, g)() for k, w, g, _, _ in ctrls}, f)
+            except OSError:
+                pass
+        for _, w, _, _, sig in ctrls:
+            getattr(w, sig).connect(save)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "osd_label"):
             self.osd_label.resize(min(1240, self.width() - 28), 46)
+            self._place_fps_label()
         if hasattr(self, "settings_panel"):
             self.settings_panel.move(
                 max(10, (self.width() - self.settings_panel.width()) // 2),
@@ -1118,6 +1328,8 @@ class GTA6FrameGenWindow(QMainWindow):
         QShortcut(QKeySequence("S"), self, activated=self.cycle_sharpness)
         QShortcut(QKeySequence("M"), self, activated=self.toggle_mute)
         QShortcut(QKeySequence("R"), self, activated=self.engine.start_recording)
+        QShortcut(QKeySequence("B"), self, activated=lambda: setattr(self.gl_widget, "compare", not self.gl_widget.compare))
+        QShortcut(QKeySequence("P"), self, activated=lambda: self.fps_label.setVisible(not self.fps_label.isVisible()))
         QShortcut(QKeySequence("A"), self, activated=self.audio.cycle_output)
         QShortcut(QKeySequence("O"), self, activated=self.toggle_osd)
 
@@ -1258,7 +1470,9 @@ class GTA6FrameGenWindow(QMainWindow):
             f"Audio: {aud_str}   ||   [Home] Settings  [F] Fullscreen  [Tab] Mode  [O] Hide Bar"
         )
         self.osd_label.setText(f"{line1}\n{line2}")
-        rec = f"[{self.engine.rec_status}] " if self.engine.rec_status else ""
+        self.fps_label.setText(f"{eff_fps:.0f} FPS")
+        self._place_fps_label()
+        rec =f"[{self.engine.rec_status}] " if self.engine.rec_status else ""
         self.setWindowTitle(f"{rec}GTA VI FrameGen — {eff_fps:.1f} FPS ({mode_str}) [Press HOME for Settings]")
 
     def closeEvent(self, event):
@@ -1290,6 +1504,7 @@ def main():
         win.combo_fps.setCurrentIndex(0)
         win.slider_blur.setValue(0)
         win.chk_osd.setChecked(False)
+        win.fps_label.hide()  # Lossless Scaling draws its own counter
 
 
     rc = app.exec()

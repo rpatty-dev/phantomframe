@@ -40,7 +40,7 @@ def main():
     flows = [tex(FW, FH, gl.GL_RG32F, gl.GL_RG, gl.GL_FLOAT) for _ in range(2)]
     tOut = tex(1920, 1080, gl.GL_RGBA8, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE)
     fbo = gl.glGenFramebuffers(1)
-    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST); dis.setUseSpatialPropagation(True)
+    dis = cv2.DISOpticalFlow_create(int(os.environ.get("PRESET", "0"))); dis.setUseSpatialPropagation(True)  # 0 ultrafast, 1 fast, 2 medium
 
     def upload(t, a):
         gl.glBindTexture(gl.GL_TEXTURE_2D, t)
