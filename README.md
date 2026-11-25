@@ -13,34 +13,41 @@
 
 ---
 
-## ⚡ One-line install
+## ⚡ Quick setup
 
-**Windows** (PowerShell):
+### Windows
 
-```powershell
-irm https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.ps1 | iex
-```
+1. Plug your capture card into the PC and the console into the capture card.
+2. Press **Start**, type `PowerShell` and open it.
+3. Paste this line and press **Enter**:
 
-**macOS** (Terminal):
+   ```powershell
+   irm https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.ps1 | iex
+   ```
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.sh | bash
-```
+4. PhantomFrame opens when the install is done. Next time, double-click **Launch.bat** in the **PhantomFrame** folder on your Desktop.
 
-You don't need anything installed first: no git, no Python, no admin rights. The installer downloads PhantomFrame, sets up its own Python 3.12, installs ffmpeg when winget or Homebrew is available, puts it on your Desktop and launches it. Run the same line again to update; your settings are kept.
+### macOS
 
-- **Windows:** installs to a **PhantomFrame** folder on your Desktop. Double-click **Launch.bat** in it to start PhantomFrame. It is also in the Start menu.
-- **macOS:** installs to `~/PhantomFrame`, with a **PhantomFrame** shortcut on your Desktop.
+1. Plug your capture card into the Mac and the console into the capture card.
+2. Press **Cmd + Space**, type `Terminal` and open it.
+3. Paste this line and press **Return**:
 
-Press **F11** for fullscreen and **HOME** (**`\`** on macOS) for settings.
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.sh | bash
+   ```
 
+4. Click **Allow** when macOS asks to use the camera (the capture card counts as one). Next time, double-click **PhantomFrame** on your Desktop.
+
+### Then
+
+- **F11**: fullscreen
+- **HOME** (**`\`** on Mac): settings
+- To update, run the same line again. Your settings are kept.
+
+> You don't need git, Python or admin rights: the installer downloads everything it needs.
 > **Need:** Windows 10/11 or macOS · a USB HDMI capture card · any GPU with OpenGL 3.3.
-
-### macOS notes
-
-- On first launch macOS asks to let Terminal use the camera. Allow it: the capture card counts as a camera. If you clicked Don't Allow, turn it on in System Settings > Privacy & Security > Camera.
-- Mac keyboards have no HOME key, so **`\`** opens settings.
-- Frames are paced on a precise timer on macOS, since Windows' DWM vblank isn't available.
+> Mac: if you clicked Don't Allow, turn the camera on for Terminal in System Settings > Privacy & Security > Camera.
 
 ---
 
