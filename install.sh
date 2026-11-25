@@ -39,8 +39,8 @@ if ! command -v ffmpeg >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
   brew install ffmpeg || say "ffmpeg install failed, continuing without it"
 fi
 
-chmod +x "$DIR/run.command"
-ln -sf "$DIR/run.command" "$HOME/Desktop/PhantomFrame.command"
+chmod +x "$DIR/run.command" "$DIR/Launch.command"
+ln -sf "$DIR/Launch.command" "$HOME/Desktop/PhantomFrame.command"
 
 say "Installed. Double-click PhantomFrame on your Desktop to run it later."
 say "Allow camera access for Terminal when macOS asks: the capture card counts as a camera."
