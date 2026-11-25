@@ -1,6 +1,5 @@
 #!/bin/zsh
-# Double-click to run PhantomFrame on macOS
+# Double-click to run PhantomFrame on macOS (install.sh sets it up)
 cd "${0:A:h}"
-PY=$(command -v python3.12 || command -v python3)
-[ -d .venv ] || { "$PY" -m venv .venv && .venv/bin/pip install -r requirements.txt; } || { rm -rf .venv; exit 1; }
+[ -x .venv/bin/python ] || PHANTOMFRAME_DIR="$PWD" exec bash ./install.sh
 exec .venv/bin/python gta6_framegen.py "$@"

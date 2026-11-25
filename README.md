@@ -1,10 +1,8 @@
 <p align="center">
-  <img src="assets/icon.png" alt="PhantomFrame icon" width="128">
+  <img src="assets/icon.png" alt="PhantomFrame" width="220">
 </p>
 
-<p align="center">
-  <img src="assets/banner.svg" alt="PhantomFrame" width="100%">
-</p>
+<h1 align="center">PhantomFrame</h1>
 
 <h3 align="center">Your console runs GTA VI at 30 FPS. Your PC shows it at 60.</h3>
 
@@ -15,28 +13,32 @@
 
 ---
 
-## ⚡ One-line setup
+## ⚡ One-line install
+
+**Windows** (PowerShell):
 
 ```powershell
-git clone https://github.com/rpatty-dev/phantomframe; cd phantomframe; pip install -r requirements.txt; python gta6_framegen.py
+irm https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.ps1 | iex
 ```
 
-That's it. Press **F11** for fullscreen and **HOME** for settings.
-
-> **Need:** Windows 10/11 or macOS · Python 3.10+ · a USB HDMI capture card · any GPU with OpenGL 3.3.
-> **Recommended:** `winget install ffmpeg` so PhantomFrame can find your capture card by name.
-
-### macOS
+**macOS** (Terminal):
 
 ```bash
-git clone https://github.com/rpatty-dev/phantomframe; cd phantomframe; ./run.command
+curl -fsSL https://raw.githubusercontent.com/rpatty-dev/phantomframe/main/install.sh | bash
 ```
 
-Or double-click `run.command` in Finder. It makes a `.venv` and installs the requirements on first run.
+You don't need anything installed first: no git, no Python, no admin rights. The installer downloads PhantomFrame, sets up its own Python 3.12, installs ffmpeg when winget or Homebrew is available, adds a **PhantomFrame** shortcut to your Desktop and launches it. Run the same line again to update; your settings are kept.
 
-- Press **`\`** for settings (Mac keyboards have no HOME key).
+Installs to `%LOCALAPPDATA%\PhantomFrame` on Windows and `~/PhantomFrame` on macOS.
+
+Press **F11** for fullscreen and **HOME** (**`\`** on macOS) for settings.
+
+> **Need:** Windows 10/11 or macOS · a USB HDMI capture card · any GPU with OpenGL 3.3.
+
+### macOS notes
+
 - On first launch macOS asks to let Terminal use the camera. Allow it: the capture card counts as a camera. If you clicked Don't Allow, turn it on in System Settings > Privacy & Security > Camera.
-- `brew install ffmpeg` lets PhantomFrame find the card by name and skip the FaceTime and iPhone cameras.
+- Mac keyboards have no HOME key, so **`\`** opens settings.
 - Frames are paced on a precise timer on macOS, since Windows' DWM vblank isn't available.
 
 ---
