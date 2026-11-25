@@ -60,8 +60,8 @@
 | **60 FPS from 30 FPS** | Every real frame gets a motion-compensated in-between frame, alternating exactly 1:1. |
 | **90 / 120 / 144 FPS targets** | 3x and 4x generation for high refresh monitors (120 is experimental). |
 | **Display-locked pacing** | Frames are presented on your monitor's own refresh (DWM vblank) instead of a timer, and a phase lock keeps each frame's deadline halfway between refreshes so capture jitter can't make it skip or double. |
-| **Adaptive delay** | The output waits just long enough for motion vectors to be ready (90th percentile of measured flow time, from 7 ms), so latency stays as low as your PC allows. |
-| **Fast** | DIS optical flow at 640×360 on its own thread (about 1–2 ms), frame building in a GPU shader. |
+| **Adaptive delay** | Real frames go straight from the capture card to the screen on the next vblank; only in-between frames wait for their own motion vectors (measured publish time, not a worst-case global delay). Latency stays as low as your PC allows. |
+| **Fast** | DIS optical flow at 640×360 on its own thread (about 1–2 ms), half-float conversion and pixel-buffer uploads off the render thread, frame building in a GPU shader. Real frames skip flow and motion-blur fetches entirely. |
 | **Two flow presets** | ULTRAFAST (~1.7 ms) or FAST HQ (~4.2 ms, finer edges). Denser flow patches give +0.15 dB at about +1 ms. |
 | **Two latency modes** | 16.6 ms hold interpolation (artifact free) or 0 ms hold hybrid extrapolation (instant). |
 | **Motion smoothing** | Motion vectors are blended with the previous frame's, so moving edges don't wobble. |
@@ -157,10 +157,10 @@ Tuned on real GTA VI gameplay. Change anything with `HOME` (`\` on macOS); your 
  HDMI 60 Hz ──► Capture thread ──► drop repeated frames ──► unique 30 FPS frames
                      │                                          │
                      │ timestamps every HDMI frame               ▼
-                     │ as an output "tick"               Flow thread (DIS optical flow, 960×540, ~5 ms)
+                     │ as an output "tick"               Flow thread (DIS optical flow, 640×360, ~1–2 ms)
                      ▼                                          │
               Tick scheduler ◄──────── motion vectors ─────────┘
-                     │   shows each tick after an adaptive delay (p90 flow latency)
+                     │   real frames: next vblank · generated: own flow publish time
                      ▼
    on upload: deblock → denoise → colour edge rebuild (same clean image for real and generated frames)
                      ▼

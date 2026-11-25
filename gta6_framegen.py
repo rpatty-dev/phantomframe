@@ -39,7 +39,7 @@ except Exception:
 # Mac keyboards have no Home key: "\\" opens settings there
 SETTINGS_KEY = "\\" if sys.platform == "darwin" else "HOME"
 
-APP_VERSION = "v1.2"
+APP_VERSION = "v1.3"
 REPO = "rpatty-dev/phantomframe"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UPDATE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -204,8 +204,9 @@ class LowLatencyAudioBridge:
 
         self.source = QAudioSource(in_dev, fmt)
         self.sink = QAudioSink(out_dev, fmt)
-        self.source.setBufferSize(2304)
-        self.sink.setBufferSize(4608)
+        # ~10ms input / ~12ms output instead of 12/24ms: same passthrough, less audio lag.
+        self.source.setBufferSize(1920)
+        self.sink.setBufferSize(2304)
 
         self.io_out = self.sink.start()
         self.io_in = self.source.start()
@@ -258,11 +259,17 @@ class CaptureFlowEngine:
         self.lock = threading.Lock()
         self.f_prev = np.zeros((1080, 1920, 3), dtype=np.uint8)
         self.f_curr = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        # f_live is published by the capture thread the instant a frame is decoded. Real frames
+        # (and raw passthrough) render from it, so they no longer wait for optical flow to finish.
+        self.f_live = self.f_curr
+        self.frame_id = 0                 # sequence of the newest decoded frame
         self.flow = np.zeros((self.FLOW_H, self.FLOW_W, 2), dtype=np.float32)
-        # Reused conversion buffer: astype() allocated 0.9MB on every pair in paintGL.
+        # Half-float conversion runs in the flow thread, not in paintGL: keeps ~0.5ms off the
+        # GPU-thread critical path on every new pair.
         self.flow_half = np.empty_like(self.flow, dtype=np.float16)
-        # id() of the buffer paintGL is uploading; capture thread must not overwrite it mid-upload.
+        # id() of the half buffer paintGL is uploading; flow thread must not overwrite it mid-upload.
         self.flow_uploading_id = None
+        self.flow_pub = {}                # seq -> time flow was published (per-tick deadlines)
         self.pair_id = 0
         self.last_unique_time = time.perf_counter()
         self.unique_period = 1.0 / 30.0
@@ -274,7 +281,7 @@ class CaptureFlowEngine:
         self.rec_frames = []
         self.rec_status = ""
         self.cap_seq = 0                  # sequence number of the latest unique frame (capture thread)
-        self.flow_delay = 0.016           # tick display delay, adapts to measured capture->flow latency
+        self.flow_delay = 0.003           # fallback only: generated ticks use their real publish time
         self._job = None                  # (seq, frame, t_capture, is_cut, gray) handed to the flow thread
         self._job_evt = threading.Event()
 
@@ -335,7 +342,9 @@ class CaptureFlowEngine:
         preset = cv2.DISOPTICAL_FLOW_PRESET_FAST if self.flow_preset == 1 else cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST
         dis = cv2.DISOpticalFlow_create(preset)
         dis.setUseSpatialPropagation(True)
-        dis.setPatchStride(3)  # denser patches: +0.15dB, +1ms (bench on 2 driving clips)
+        # Stride 4 saves ~1ms on the default ULTRAFAST preset (-0.15dB); keep the denser
+        # stride 3 on FAST HQ where the user already accepts the extra compute for quality.
+        dis.setPatchStride(4 if self.flow_preset == 0 else 3)
         return dis
 
     def _loop(self):
@@ -414,6 +423,10 @@ class CaptureFlowEngine:
 
             with self.lock:
                 self.last_unique_time = t_now
+                # Publish the decoded frame now. Real ticks only need this, not the flow pair, so
+                # a busy flow thread can no longer hold the picture back.
+                self.frame_id = self.cap_seq
+                self.f_live = frame
                 self.ticks.append((t_now, self.cap_seq, 1.0 if is_cut else 0.5))
             # Latest-wins handoff: if flow is still busy the older pending frame is simply skipped
             self._job = (self.cap_seq, frame, t_now, is_cut, small)
@@ -428,6 +441,7 @@ class CaptureFlowEngine:
         # Triple buffer: publish by reference instead of copying ~1.8MB under the lock. paintGL marks
         # the buffer it is uploading; skip that slot so a slow GUI can never be overwritten mid-upload.
         flow_bufs = [np.zeros((self.FLOW_H, self.FLOW_W, 2), dtype=np.float32) for _ in range(3)]
+        half_bufs = [np.empty_like(flow_bufs[0], dtype=np.float16) for _ in range(3)]
         slot = 0
         lat = deque(maxlen=30)
 
@@ -440,10 +454,12 @@ class CaptureFlowEngine:
                 continue
             seq, frame, t_cap, is_cut, gray = job
             flow_buf = flow_bufs[slot]
+            half_buf = half_bufs[slot]
             with self.lock:
-                if id(flow_buf) == self.flow_uploading_id:
+                if id(half_buf) == self.flow_uploading_id:
                     slot = (slot + 1) % len(flow_bufs)
                     flow_buf = flow_bufs[slot]
+                    half_buf = half_bufs[slot]
             if self._rebuild_dis:
                 dis = self._create_dis()
                 self._rebuild_dis = False
@@ -460,22 +476,28 @@ class CaptureFlowEngine:
                 m = np.hypot(flow_buf[::8, ::8, 0], flow_buf[::8, ::8, 1])  # stats from a 1/64 sample
                 self.flow_max_px = float(m.max()) * (1920.0 / self.FLOW_W)
                 self.flow_mean_px = float(m.mean()) * (1920.0 / self.FLOW_W)
+            # Convert here instead of in paintGL: the GPU thread only uploads ready-to-use bytes.
+            np.copyto(half_buf, flow_buf)
             self.flow_ms = (time.perf_counter() - t_flow0) * 1000.0
 
+            t_pub = time.perf_counter()
             with self.lock:
                 self.f_prev = frame if prev_full is None else prev_full
                 self.f_curr = frame
                 self.flow = flow_buf
+                self.flow_half = half_buf
                 self.scene_cut = is_cut
                 self.pair_id = seq
+                self.flow_pub[seq] = t_pub
+                if len(self.flow_pub) > 12:  # bounded: only recent pairs can still have live ticks
+                    for old in sorted(self.flow_pub)[:-8]:
+                        del self.flow_pub[old]
             slot = (slot + 1) % len(flow_bufs)
             prev_gray, prev_full = gray, frame
 
-            # Display delay = p90 capture->publish latency + margin, so ticks are never shown before their frame
-            lat.append(time.perf_counter() - t_cap)
-            # Floor lowered from 10ms to 7ms: ultrafast DIS + publish is ~3ms, so 10ms was pure
-            # added latency. p90+3ms still dominates on slower machines.
-            self.flow_delay = float(np.clip(np.percentile(lat, 90) + 0.003, 0.007, 0.035))
+            # Fallback deadline only (flow_pub is normally used). Kept conservative for slow machines.
+            lat.append(t_pub - t_cap)
+            self.flow_delay = float(np.clip(np.percentile(lat, 95) + 0.002, 0.003, 0.035))
 
 
 VERTEX_SHADER = """
@@ -496,6 +518,7 @@ out vec4 fragColor;
 
 uniform sampler2D u_texPrev;
 uniform sampler2D u_texCurr;
+uniform sampler2D u_texLive;      // newest decoded frame, ready before flow finishes
 uniform sampler2D u_texFlow;      // raw DIS flow, prev->curr, in 640x360 pixels
 uniform sampler2D u_texFlowPrev;  // previous pair's raw flow (temporal smoothing)
 uniform int u_smooth;             // 1 = motion smoothing on
@@ -659,23 +682,31 @@ float hudAndTextLock(vec2 uv, vec3 cPrev, vec3 cCurr) {
     return clamp(max(textLock, hudZone), 0.0, 1.0);
 }
 
-// Computed once per fragment and reused by the blur pass below (saves 3 flow fetches).
+// Computed once per fragment and reused by the blur pass below (saves 3 flow + 4 HUD fetches).
 vec2 g_flow;
+float g_lock;
 
 vec3 synthesizeFrame(vec2 uv, float t) {
+    g_flow = vec2(0.0);
+    g_lock = 0.0;
+    // Real frames need no vectors at all: skip 3 flow fetches and one colour fetch. Half the
+    // output frames take this path, so it also helps us never miss a vblank deadline.
+    if (t >= 0.99) return applyCAS(u_texCurr, uv, texture(u_texCurr, uv).rgb, u_sharpness);
+    if (t <= 0.01) return applyCAS(u_texPrev, uv, texture(u_texPrev, uv).rgb, u_sharpness);
     g_flow = flowAt(uv);
     vec3 rawPrev = texture(u_texPrev, uv).rgb;
     vec3 rawCurr = texture(u_texCurr, uv).rgb;
-    if (t >= 0.99) return applyCAS(u_texCurr, uv, rawCurr, u_sharpness);
-    if (t <= 0.01) return applyCAS(u_texPrev, uv, rawPrev, u_sharpness);
 
     // Minimap (bottom-left): plain crossfade, no warp. Its rotation breaks the flow; benchmarked
     // as the best of 10 methods (+1.7dB on the map, +0.05dB overall, zero extra latency)
-    if (u_hudProtect == 1 && uv.x > 0.047 && uv.x < 0.276 && uv.y > 0.676 && uv.y < 0.958)
+    if (u_hudProtect == 1 && uv.x > 0.047 && uv.x < 0.276 && uv.y > 0.676 && uv.y < 0.958) {
+        g_lock = 1.0;  // crossfaded map: never blur its rotating arrows
         return mix(rawPrev, rawCurr, t);
+    }
 
     // Check HUD & Text lock first
     float lockAmt = hudAndTextLock(uv, rawPrev, rawCurr);
+    g_lock = lockAmt;
     if (lockAmt >= 0.96) {
         return rawCurr;
     }
@@ -719,8 +750,8 @@ vec3 hsv2rgb(vec3 c) {
 
 void main() {
     if (u_mode == 1) {
-        vec3 c = texture(u_texCurr, v_uv).rgb;
-        fragColor = vec4(finish(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
+        vec3 c = texture(u_texLive, v_uv).rgb;
+        fragColor = vec4(finish(applyCAS(u_texLive, v_uv, c, u_sharpness), v_uv), 1.0);
         return;
     }
     if (u_mode == 3) {
@@ -752,8 +783,8 @@ void main() {
             return;
         }
         if (v_uv.x < 0.5) {
-            vec3 c = texture(u_texCurr, v_uv).rgb;
-            fragColor = vec4(finish(applyCAS(u_texCurr, v_uv, c, u_sharpness), v_uv), 1.0);
+            vec3 c = texture(u_texLive, v_uv).rgb;
+            fragColor = vec4(finish(applyCAS(u_texLive, v_uv, c, u_sharpness), v_uv), 1.0);
         } else {
             fragColor = vec4(finish(synthesizeFrame(v_uv, u_alpha), v_uv), 1.0);
         }
@@ -762,15 +793,15 @@ void main() {
 
     // Mode 0: Full Motion-Compensated Frame Generation
     vec3 col = synthesizeFrame(v_uv, u_alpha);
-    if (u_blur > 0.001) {
+    // Real frames are already sharp captures: blurring them only costs 10 fetches and softens the
+    // picture. Blur synthesized frames only, and reuse the HUD mask computed in synthesizeFrame.
+    if (u_blur > 0.001 && u_alpha < 0.99 && u_alpha > 0.01) {
         // Per-pixel motion blur along the flow vector, spanning the output frame's shutter
         vec2 v = g_flow;
         float m = length(v);
         if (m > 0.0004) {
             if (m > 0.075) v *= 0.075 / m;
-            vec3 rawPrev = texture(u_texPrev, v_uv).rgb;
-            vec3 rawCurr = texture(u_texCurr, v_uv).rgb;
-            float keep = hudAndTextLock(v_uv, rawPrev, rawCurr);  // never smear HUD/subtitles
+            float keep = g_lock;  // never smear HUD/subtitles
             vec2 span = v * (u_frameStep * u_blur);
             float t = clamp(u_alpha, 0.0, 1.0);
             vec3 acc = col;
@@ -865,9 +896,14 @@ class FrameGenGLWidget(QOpenGLWidget):
         self.vao = None
         self.tex_prev = None
         self.tex_curr = None
+        self.tex_live = None
         self.tex_flow = None
+        self.pbos = None
+        self.pbo_idx = 0
 
         self.uploaded_pair_id = -1
+        self.uploaded_frame_id = -1
+        self.last_render = None  # (seq, alpha, old, use_live) for hold-on-no-tick
         self._viewport = (0, 0, 1920, 1080)
         self.mode = 0                  # 0: FrameGen, 1: Raw Passthrough, 2: Split Compare, 3: Flow Heatmap
         self.target_fps = 60           # 30, 60, 90, 120, 144
@@ -904,9 +940,14 @@ class FrameGenGLWidget(QOpenGLWidget):
         self.phase_adj = 0.0  # extra tick delay that keeps deadlines mid-way between vblanks (no flip-flopping)
         if self.use_vblank:
             self._vb = _VBlank()
-            self._vb.tick.connect(self.update)
+            # repaint() paints in this slot instead of posting another paint event: one less
+            # event-loop hop between the DWM vblank and the actual swap (~1ms per frame).
+            self._vb.tick.connect(self._present)
             threading.Thread(target=self._vblank_loop, daemon=True).start()
         self.set_target_fps(60)
+
+    def _present(self):
+        self.repaint()
 
     def _vblank_loop(self):
         flush = ctypes.windll.dwmapi.DwmFlush
@@ -947,12 +988,13 @@ class FrameGenGLWidget(QOpenGLWidget):
             shaders.compileShader(PREFILTER_FS, gl.GL_FRAGMENT_SHADER), validate=False)
         # Uniform locations are immutable for a linked program; querying them per paint is driver work
         self.u = {name: gl.glGetUniformLocation(self.program, name) for name in (
-            "u_texPrev", "u_texCurr", "u_texFlow", "u_texFlowPrev", "u_smooth", "u_alpha",
+            "u_texPrev", "u_texCurr", "u_texLive", "u_texFlow", "u_texFlowPrev", "u_smooth", "u_alpha",
             "u_mode", "u_sharpness", "u_hudProtect", "u_texelSize", "u_blur", "u_frameStep",
             "u_devig", "u_clarity", "u_vibrance", "u_contrast", "u_compare")}
         # Sampler units and texel size are program constants: set once, not every paint.
         gl.glUseProgram(self.program)
-        for name, unit in (("u_texPrev", 0), ("u_texCurr", 1), ("u_texFlow", 2), ("u_texFlowPrev", 3)):
+        for name, unit in (("u_texPrev", 0), ("u_texCurr", 1), ("u_texFlow", 2), ("u_texFlowPrev", 3),
+                           ("u_texLive", 4)):
             gl.glUniform1i(self.u[name], unit)
         gl.glUniform2f(self.u["u_texelSize"], 1.0 / 1920.0, 1.0 / 1080.0)
 
@@ -964,6 +1006,7 @@ class FrameGenGLWidget(QOpenGLWidget):
         self.pp_valid = False
         self.tex_prev = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
         self.tex_curr = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
+        self.tex_live = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
         for t in (self.tex_pp, self.tex_prev, self.tex_curr):
             gl.glBindTexture(gl.GL_TEXTURE_2D, t)
             gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
@@ -976,10 +1019,35 @@ class FrameGenGLWidget(QOpenGLWidget):
             gl.GL_RG16F, gl.GL_RG, gl.GL_HALF_FLOAT
         ) for _ in range(2))
 
+        # Double-buffered pixel-buffer objects: the 6MB upload no longer stalls the GPU thread
+        # waiting for the previous frame's transfer to finish. Fall back to a direct upload if
+        # the driver refuses PBOs.
+        try:
+            self.pbos = gl.glGenBuffers(2)
+            for pbo in self.pbos:
+                gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, pbo)
+                gl.glBufferData(gl.GL_PIXEL_UNPACK_BUFFER, 1920 * 1080 * 3, None, gl.GL_STREAM_DRAW)
+            gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, 0)
+        except Exception:
+            gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, 0)
+            self.pbos = None
+
     def _prefilter(self, frame, target):
         # Upload a captured BGR frame and write its cleaned version (+ mipmaps) into target
-        gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_raw)
-        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 1920, 1080, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, frame)
+        arr = np.ascontiguousarray(frame)
+        if self.pbos is not None:
+            pbo = self.pbos[self.pbo_idx]
+            self.pbo_idx ^= 1
+            gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, pbo)
+            gl.glBufferSubData(gl.GL_PIXEL_UNPACK_BUFFER, 0, arr.nbytes, arr)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_raw)
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 1920, 1080,
+                               gl.GL_BGR, gl.GL_UNSIGNED_BYTE, None)
+            gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, 0)
+        else:
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_raw)
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 1920, 1080,
+                               gl.GL_BGR, gl.GL_UNSIGNED_BYTE, arr)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.pre_fbo)
         gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, target, 0)
         gl.glViewport(0, 0, 1920, 1080)
@@ -992,6 +1060,16 @@ class FrameGenGLWidget(QOpenGLWidget):
         gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
         gl.glBindTexture(gl.GL_TEXTURE_2D, target)
         gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        gl.glViewport(*self._viewport)
+
+    def _copy_clean(self, src, dst):
+        # When pair and live textures are the same captured frame, blit the already-cleaned
+        # result instead of running the 9-tap prefilter shader a second time.
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.pre_fbo)
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, src, 0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, dst)
+        gl.glCopyTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 0, 0, 1920, 1080)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.defaultFramebufferObject())
         gl.glViewport(*self._viewport)
 
@@ -1024,18 +1102,24 @@ class FrameGenGLWidget(QOpenGLWidget):
 
         with self.engine.lock:
             pair_id = self.engine.pair_id
+            frame_id = self.engine.frame_id
             t_arrival = self.engine.last_unique_time
             period = self.engine.unique_period
             scene_cut = self.engine.scene_cut
             ticks = list(self.engine.ticks)
+            flow_pub = dict(self.engine.flow_pub)
             need_upload = (pair_id != self.uploaded_pair_id)
             consecutive = (pair_id == self.uploaded_pair_id + 1)
+            need_live = (frame_id != self.uploaded_frame_id)
             if need_upload:
                 f_prev = self.engine.f_prev
                 f_curr = self.engine.f_curr
-                flow = self.engine.flow
-                self.engine.flow_uploading_id = id(flow)
+                flow_half = self.engine.flow_half
+                self.engine.flow_uploading_id = id(flow_half)
                 self.uploaded_pair_id = pair_id
+            if need_live:
+                f_live = self.engine.f_live
+                self.uploaded_frame_id = frame_id
 
         if need_upload:
             try:
@@ -1047,16 +1131,25 @@ class FrameGenGLWidget(QOpenGLWidget):
                     self._prefilter(f_prev, self.tex_prev)
                 self._prefilter(f_curr, self.tex_curr)
                 self.tex_flow, self.tex_flow_prev = self.tex_flow_prev, self.tex_flow  # keep last flow for smoothing
-                np.copyto(self.engine.flow_half, flow)
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_flow)
                 gl.glTexSubImage2D(
                     gl.GL_TEXTURE_2D, 0, 0, 0,
                     CaptureFlowEngine.FLOW_W, CaptureFlowEngine.FLOW_H,
-                    gl.GL_RG, gl.GL_HALF_FLOAT, self.engine.flow_half
+                    gl.GL_RG, gl.GL_HALF_FLOAT, flow_half
                 )
             finally:
                 with self.engine.lock:
                     self.engine.flow_uploading_id = None
+
+        live_done = False
+        if need_upload and need_live and f_curr is f_live:
+            # Same frame in both paths (the usual case): reuse its cleaned pixels for the live texture.
+            self._copy_clean(self.tex_curr, self.tex_live)
+            live_done = True
+        if need_live and not live_done:
+            # Cleaned as soon as the frame is decoded: real frames can now be presented on the
+            # very next vblank even when the flow thread is still busy.
+            self._prefilter(f_live, self.tex_live)
 
         # Compute sub-frame interpolation phase alpha based on target_fps (30, 60, 90, 120, 144)
         # Nominal 30fps console frame interval is 33.333ms (16.667ms half-period)
@@ -1065,40 +1158,77 @@ class FrameGenGLWidget(QOpenGLWidget):
 
         tick_sig = None
         old = False  # render the previous pair (tex_pp -> tex_prev) instead of the current one
+        use_live = False  # real frame: bind the freshly decoded texture, no flow needed
+        render_seq = pair_id
+        chosen_tick = None
         if scene_cut or self.mode == 1 or self.target_fps <= 30:
             alpha = 1.0
+            use_live = True
         elif self.zero_hold_extrap:
             alpha = 1.0 if elapsed < half_period else 1.38
+            use_live = True
         elif self.target_fps in (60, 120):
-            # One output tick per HDMI frame (midpoint on unique, real on repeat), shown a fixed 16ms
-            # after capture so the 5-6ms flow compute on unique frames doesn't skew the cadence.
-            # 120 (experimental): each tick splits into two 8.33ms sub-frames (0.25/0.5 then 0.75/1.0).
-            alpha, tick_sig = 1.0, (pair_id, 1.0)
-            flow_delay = self.engine.flow_delay + self.phase_adj
+            # Real ticks (alpha 1) are ready the moment they are decoded: show them on the next
+            # vblank. Midpoint ticks wait only for their own flow publish, not a global p90 delay.
+            alpha = 1.0
             t_sel = self.vblank_t if self.use_vblank else t_now
+            base_delay = self.engine.flow_delay
             for t_cap, tp, ta in reversed(ticks):
-                due = t_cap + flow_delay  # adaptive: p90 capture->flow-publish latency
-                if tp > pair_id:
-                    continue  # this frame's flow isn't published yet; fall back to an older tick
-                if due <= t_sel:
-                    a = ta
+                is_real = ta >= 0.99
+                if self.target_fps == 120 and tp > pair_id:
+                    continue  # 120Hz subframes still need the published pair
+                if is_real:
+                    if tp > frame_id:
+                        continue
+                    base_due = t_cap + 0.0005
+                    due = base_due  # no phase lock here: real frames want the *next* vblank
+                else:
+                    if tp > pair_id:
+                        continue  # this frame's flow isn't published yet
+                    base_due = flow_pub.get(tp, t_cap + base_delay)
+                    due = base_due + self.phase_adj
+                if due > t_sel:
+                    continue
+                a = ta
+                if self.target_fps == 120:
+                    # 120Hz: each tick splits into two 8.33ms sub-frames (0.25/0.5 then 0.75/1.0).
+                    a = ta - (0.0 if t_sel - due >= 0.00833 else 0.25)
+                if self.use_vblank and not is_real and (tp, a) != self.last_presented_signature:
+                    # phase lock: steer (vblank - due) toward half a refresh so capture jitter can't flip it
+                    P = self.vb_period
+                    err = (t_sel - due) % P - P / 2
+                    adj = self.phase_adj + 0.05 * err
+                    self.phase_adj = adj + P if adj < -0.004 else min(adj, P)
+                chosen_tick = (t_cap, tp, ta)
+                render_seq = tp
+                tick_sig = (tp, a)
+                alpha = a
+                if is_real:
                     if self.target_fps == 120:
-                        a = ta - (0.0 if t_sel - due >= 0.00833 else 0.25)
-                    if self.use_vblank and (tp, a) != self.last_presented_signature:
-                        # phase lock: steer (vblank - due) toward half a refresh so capture jitter can't flip it
-                        P = self.vb_period
-                        err = (t_sel - due) % P - P / 2
-                        adj = self.phase_adj + 0.05 * err
-                        self.phase_adj = adj + P if adj < -0.004 else min(adj, P)  # wrap one refresh, never wait > 4ms less
-                    alpha = a
-                    if tp < pair_id:
-                        # Tick from the previous pair: finish it on the kept textures, else show its
-                        # real frame (= the new pair's f_prev, alpha 0)
                         old = tp == pair_id - 1 and self.pp_valid
                         if not old:
-                            alpha = 0.0
-                    tick_sig = (tp, a)
-                    break
+                            alpha = 0.0 if tp < pair_id else 1.0
+                    else:
+                        use_live = True
+                else:
+                    old = tp == pair_id - 1 and self.pp_valid
+                    if not old and tp < pair_id:
+                        alpha = 0.0
+                break
+            if chosen_tick is not None:
+                # Discard consumed ticks so a stale midpoint is never replayed after its real
+                # frame (that would show one picture twice and break the cadence).
+                with self.engine.lock:
+                    q = self.engine.ticks
+                    if any(t is chosen_tick for t in q):  # may have been evicted from the bounded deque
+                        while q and q[0] is not chosen_tick:
+                            q.popleft()
+            elif self.last_render is not None:
+                # Nothing due yet: hold the last presented frame rather than jumping ahead.
+                render_seq, alpha, old, use_live = self.last_render
+                tick_sig = (render_seq, alpha)
+            else:
+                use_live = True
         elif self.target_fps == 90:
             # 3x FrameGen (30 -> 90 FPS): 3-step cadence (11.1ms each: 0.33, 0.67, 1.0)
             if elapsed < 0.0111:
@@ -1107,10 +1237,13 @@ class FrameGenGLWidget(QOpenGLWidget):
                 alpha = 0.667
             else:
                 alpha = 1.0
+            use_live = alpha >= 0.99
         else:
             # 144 FPS (old wall-clock pacing): 4-step quantized cadence (8.33ms each: 0.25, 0.50, 0.75, 1.0)
             step = min(4, int(elapsed / 0.00833) + 1)
             alpha = step * 0.25
+            use_live = alpha >= 0.99
+        self.last_render = (render_seq, alpha, old, use_live)
 
         # Track genuinely distinct visual frames presented to screen
         sig = tick_sig or (pair_id, round(alpha, 2))
@@ -1131,6 +1264,8 @@ class FrameGenGLWidget(QOpenGLWidget):
             t_prev, t_curr, t_flow = self.tex_pp, self.tex_prev, self.tex_flow_prev
         else:
             t_prev, t_curr, t_flow = self.tex_prev, self.tex_curr, self.tex_flow
+        if use_live:
+            t_curr = self.tex_live
 
         u = self.u
         gl.glActiveTexture(gl.GL_TEXTURE0)
@@ -1143,6 +1278,8 @@ class FrameGenGLWidget(QOpenGLWidget):
         gl.glBindTexture(gl.GL_TEXTURE_2D, t_flow)
         gl.glActiveTexture(gl.GL_TEXTURE3)
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_flow_prev)
+        gl.glActiveTexture(gl.GL_TEXTURE4)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_live)
         gl.glUniform1i(u["u_smooth"], 1 if self.engine.motion_smoothing else 0)
 
         gl.glUniform1f(u["u_alpha"], float(alpha))
@@ -1689,6 +1826,8 @@ def main():
     app.setWindowIcon(QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png")))  # taskbar + Dock
     win = GTA6FrameGenWindow(auto_quit_sec=auto_quit)
     win.show()
+    if "--fullscreen" in sys.argv:
+        win.toggle_fullscreen()  # restore borderless mode when relaunching mid-session
 
     if "--lsfg" in sys.argv:
         # Clean 30fps passthrough window for Lossless Scaling's LSFG to frame-generate on top of

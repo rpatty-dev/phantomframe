@@ -1,6 +1,7 @@
 recordings/
 __pycache__/
 *.bak
+*.bak-*
 *.npy
 settings.json
 .venv/
