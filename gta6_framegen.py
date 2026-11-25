@@ -199,6 +199,8 @@ class CaptureFlowEngine:
         self.f_prev = np.zeros((1080, 1920, 3), dtype=np.uint8)
         self.f_curr = np.zeros((1080, 1920, 3), dtype=np.uint8)
         self.flow = np.zeros((self.FLOW_H, self.FLOW_W, 2), dtype=np.float32)
+        # Reused conversion buffer: astype() allocated 0.9MB on every pair in paintGL.
+        self.flow_half = np.empty_like(self.flow, dtype=np.float16)
         # id() of the buffer paintGL is uploading; capture thread must not overwrite it mid-upload.
         self.flow_uploading_id = None
         self.pair_id = 0
@@ -309,10 +311,12 @@ class CaptureFlowEngine:
             if len(cap_times) >= 2:
                 self.capture_fps = (len(cap_times) - 1) / max(1e-6, cap_times[-1] - cap_times[0])
 
-            # One 640x360 luma prep serves both duplicate detection and DIS flow. On the capture PC
-            # the old separate 480x270 dedupe resize cost 3.3ms/frame; this shared pass is ~1.8ms total.
+            # One 640x360 luma prep serves both duplicate detection and DIS flow. The old separate
+            # 480x270 dedupe resize cost 3.3ms/frame; this shared pass is now ~0.6ms on the capture PC.
+            # INTER_LINEAR instead of INTER_AREA: 0.6ms vs 1.6ms on the capture PC for the whole
+            # prep+dedupe pass; app bench PSNR 29.75 -> 29.69dB (-0.06), worst10 unchanged.
             small = cv2.GaussianBlur(cv2.cvtColor(
-                cv2.resize(frame, (self.FLOW_W, self.FLOW_H), interpolation=cv2.INTER_AREA),
+                cv2.resize(frame, (self.FLOW_W, self.FLOW_H), interpolation=cv2.INTER_LINEAR),
                 cv2.COLOR_BGR2GRAY), (3, 3), 0)
 
             # Duplicate frame from 30fps console inside 60Hz container:
@@ -536,7 +540,9 @@ float textEdgeStrength(sampler2D tex, vec2 uv, vec3 center) {
 
 // Contrast Adaptive Sharpening (CAS) with automatic anti-ringing suppression around text/high-contrast edges
 vec3 applyCAS(sampler2D tex, vec2 uv, vec3 center, float amt) {
-    // Deblock/denoise/color rebuild already ran in the per-frame prefilter pass (PREFILTER_FS)
+    // Deblock/denoise/color rebuild already ran in the per-frame prefilter pass (PREFILTER_FS).
+    // At the default sharpness=0, skip 6 texture fetches: -0.01dB mean, ~0.15ms at 1080p.
+    if (amt <= 0.01) return center;
     vec2 ts = u_texelSize;
     vec3 n = texture(tex, uv + vec2(0.0, -ts.y)).rgb;
     vec3 s = texture(tex, uv + vec2(0.0,  ts.y)).rgb;
@@ -553,8 +559,6 @@ vec3 applyCAS(sampler2D tex, vec2 uv, vec3 center, float amt) {
     if (max(max(dmax.r, dmax.g), dmax.b) < 0.012) {
         den = (den + b0 + b1) / 3.0 + (h - 0.5) / 255.0;
     }
-
-    if (amt <= 0.01) return den;
 
     // 3. CAS on luma only (sharpening chroma just amplifies MJPEG color noise)
     float ln = getLuma(n), ls = getLuma(s), lw = getLuma(w), le = getLuma(e), ld = getLuma(den);
@@ -579,7 +583,8 @@ float hudAndTextLock(vec2 uv, vec3 cPrev, vec3 cCurr) {
 
     // 2. High-contrast text/UI edges anywhere on screen
     float edgeCurr = textEdgeStrength(u_texCurr, uv, cCurr);
-    float edgePrev = textEdgeStrength(u_texPrev, uv, cPrev);
+    // Prev-frame edge tap was redundant on recorded gameplay (PSNR unchanged) and cost 4 fetches.
+    float edgePrev = 0.0;
     float textLock = max(edgeCurr, edgePrev) * (1.0 - smoothstep(0.05, 0.22, colorDiff));
 
     // 3. Center reticle & outer HUD corners
@@ -594,7 +599,11 @@ float hudAndTextLock(vec2 uv, vec3 cPrev, vec3 cCurr) {
     return clamp(max(textLock, hudZone), 0.0, 1.0);
 }
 
+// Computed once per fragment and reused by the blur pass below (saves 3 flow fetches).
+vec2 g_flow;
+
 vec3 synthesizeFrame(vec2 uv, float t) {
+    g_flow = flowAt(uv);
     vec3 rawPrev = texture(u_texPrev, uv).rgb;
     vec3 rawCurr = texture(u_texCurr, uv).rgb;
     if (t >= 0.99) return applyCAS(u_texCurr, uv, rawCurr, u_sharpness);
@@ -611,9 +620,9 @@ vec3 synthesizeFrame(vec2 uv, float t) {
         return rawCurr;
     }
 
-    // Single flowAt: on the recorded gameplay clip the 4 neighbour taps changed PSNR by <0.003dB
+    // Single flowAt (cached in g_flow): on recorded gameplay 4 neighbour taps changed PSNR by <0.003dB
     // while adding 12 texture fetches per pixel (~0.6ms at 1080p).
-    vec2 v = flowAt(uv);
+    vec2 v = g_flow;
 
     // Scale down flow on high-contrast text edges to prevent character tearing
     v *= (1.0 - lockAmt);
@@ -695,7 +704,7 @@ void main() {
     vec3 col = synthesizeFrame(v_uv, u_alpha);
     if (u_blur > 0.001) {
         // Per-pixel motion blur along the flow vector, spanning the output frame's shutter
-        vec2 v = flowAt(v_uv);
+        vec2 v = g_flow;
         float m = length(v);
         if (m > 0.0004) {
             if (m > 0.075) v *= 0.075 / m;
@@ -881,10 +890,16 @@ class FrameGenGLWidget(QOpenGLWidget):
             "u_texPrev", "u_texCurr", "u_texFlow", "u_texFlowPrev", "u_smooth", "u_alpha",
             "u_mode", "u_sharpness", "u_hudProtect", "u_texelSize", "u_blur", "u_frameStep",
             "u_devig", "u_clarity", "u_vibrance", "u_contrast", "u_compare")}
+        # Sampler units and texel size are program constants: set once, not every paint.
+        gl.glUseProgram(self.program)
+        for name, unit in (("u_texPrev", 0), ("u_texCurr", 1), ("u_texFlow", 2), ("u_texFlowPrev", 3)):
+            gl.glUniform1i(self.u[name], unit)
+        gl.glUniform2f(self.u["u_texelSize"], 1.0 / 1920.0, 1.0 / 1080.0)
+
         self.pre_u_src = gl.glGetUniformLocation(self.pre_program, "u_src")
         self.pre_u_texel = gl.glGetUniformLocation(self.pre_program, "u_texel")
         self.pre_fbo = gl.glGenFramebuffers(1)
-        self.tex_raw = self._create_texture(1920, 1080, gl.GL_RGBA8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
+        self.tex_raw = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
         self.tex_pp = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
         self.pp_valid = False
         self.tex_prev = self._create_texture(1920, 1080, gl.GL_RGB8, gl.GL_BGR, gl.GL_UNSIGNED_BYTE)
@@ -895,9 +910,10 @@ class FrameGenGLWidget(QOpenGLWidget):
             # grade() only samples mip 5 (local mean); skip building unused levels 6-10
             gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAX_LEVEL, 5)
             gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+        # Half float matches DIS output precision well within 0.001dB and halves flow upload bandwidth.
         self.tex_flow, self.tex_flow_prev = (self._create_texture(
             CaptureFlowEngine.FLOW_W, CaptureFlowEngine.FLOW_H,
-            gl.GL_RG32F, gl.GL_RG, gl.GL_FLOAT
+            gl.GL_RG16F, gl.GL_RG, gl.GL_HALF_FLOAT
         ) for _ in range(2))
 
     def _prefilter(self, frame, target):
@@ -971,11 +987,12 @@ class FrameGenGLWidget(QOpenGLWidget):
                     self._prefilter(f_prev, self.tex_prev)
                 self._prefilter(f_curr, self.tex_curr)
                 self.tex_flow, self.tex_flow_prev = self.tex_flow_prev, self.tex_flow  # keep last flow for smoothing
+                np.copyto(self.engine.flow_half, flow)
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_flow)
                 gl.glTexSubImage2D(
                     gl.GL_TEXTURE_2D, 0, 0, 0,
                     CaptureFlowEngine.FLOW_W, CaptureFlowEngine.FLOW_H,
-                    gl.GL_RG, gl.GL_FLOAT, flow
+                    gl.GL_RG, gl.GL_HALF_FLOAT, self.engine.flow_half
                 )
             finally:
                 with self.engine.lock:
@@ -1058,25 +1075,20 @@ class FrameGenGLWidget(QOpenGLWidget):
         u = self.u
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, t_prev)
-        gl.glUniform1i(u["u_texPrev"], 0)
 
         gl.glActiveTexture(gl.GL_TEXTURE1)
         gl.glBindTexture(gl.GL_TEXTURE_2D, t_curr)
-        gl.glUniform1i(u["u_texCurr"], 1)
 
         gl.glActiveTexture(gl.GL_TEXTURE2)
         gl.glBindTexture(gl.GL_TEXTURE_2D, t_flow)
-        gl.glUniform1i(u["u_texFlow"], 2)
         gl.glActiveTexture(gl.GL_TEXTURE3)
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex_flow_prev)
-        gl.glUniform1i(u["u_texFlowPrev"], 3)
         gl.glUniform1i(u["u_smooth"], 1 if self.engine.motion_smoothing else 0)
 
         gl.glUniform1f(u["u_alpha"], float(alpha))
         gl.glUniform1i(u["u_mode"], int(self.mode))
         gl.glUniform1f(u["u_sharpness"], float(self.sharpness))
         gl.glUniform1i(u["u_hudProtect"], 1 if self.hud_protect else 0)
-        gl.glUniform2f(u["u_texelSize"], 1.0 / 1920.0, 1.0 / 1080.0)
         gl.glUniform1f(u["u_blur"], float(self.motion_blur))
         gl.glUniform1f(u["u_frameStep"], 30.0 / max(30, self.target_fps))
         gl.glUniform1f(u["u_devig"], float(self.devignette))
